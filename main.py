@@ -35,45 +35,30 @@ telephony_service = None
 
 # Dynamic fields for Brigade Eternia site visit flow
 BRIGADE_ETERNIA_DYNAMIC_FIELDS = {
-    "user_confirmed_identity": {
+    "conversation_stage": {
         "type": "string",
-        "description": "yes or no",
-        "default": "none"
+        "description": "Stage",
+        "default": "identity_check"
     },
-    "wants_site_visit": {
-        "type": "string", 
-        "description": "yes, no, maybe, or none",
-        "default": "none"
-    },
-    "wants_details_first": {
+    "preferred_bhk": {
         "type": "string",
-        "description": "yes or no",
-        "default": "none"  
+        "description": "BHK",
+        "default": "none"
     },
     "visit_date": {
         "type": "string",
-        "description": "Date user wants to visit (e.g., 'Saturday', 'Feb 15')",
+        "description": "Date",
         "default": "none"
     },
     "visit_time": {
         "type": "string",
-        "description": "Time slot (e.g., '10 AM', '3 PM', 'morning', 'evening')",
+        "description": "Time",
         "default": "none"
     },
-    "visit_booking_attempts": {
+    "visit_confirmed": {
         "type": "string",
-        "description": "Number of times asked: 1, 2, 3",
-        "default": "none"
-    },
-    "budget_range": {
-        "type": "string",
-        "description": "Budget interest",
-        "default": "none"
-    },
-    "preferred_bhk": {
-        "type": "string",
-        "description": "3 BHK or 4 BHK",
-        "default": "none"
+        "description": "Confirmed",
+        "default": "no"
     }
 }
 
@@ -241,8 +226,7 @@ async def initialize_call_session(session_id: str, websocket: WebSocket):
         'speed': config.CARTESIA_SPEED if config.TTS_PROVIDER == 'cartesia' else config.SARVAM_SPEED
     }
     if config.TTS_PROVIDER == 'cartesia':
-        # Use multilingual model for non-English
-        tts_kwargs['model_id'] = 'sonic-multilingual' if config.LANGUAGE != 'english' else config.CARTESIA_MODEL_ID
+        tts_kwargs['model_id'] = config.CARTESIA_MODEL_ID
     
     tts_service = TTSServiceFactory.create(
         provider=config.TTS_PROVIDER,
@@ -271,7 +255,6 @@ async def initialize_call_session(session_id: str, websocket: WebSocket):
         system_prompt_template=system_prompt
     )
     
-    # Store session
     active_sessions[session_id] = {
         "session_id": session_id,
         "websocket": websocket,
@@ -280,7 +263,10 @@ async def initialize_call_session(session_id: str, websocket: WebSocket):
         "llm_service": llm_service,
         "conversation_history": [],
         "start_time": datetime.now(),
-        "enquiry_data": enquiry
+        "enquiry_data": enquiry,
+        "completed_stages": [],       # Track what's done
+        "current_stage": "identity_check",  # Track current stage
+        "call_ended": False
     }
     
     # Send greeting with first name only
@@ -305,6 +291,11 @@ async def handle_transcription(text: str, session_id: str):
     if not session:
         return
     
+    # If call already ended, ignore everything
+    if session.get("call_ended"):
+        logger.info(f"[{session_id}] Call already ended, ignoring input")
+        return
+    
     logger.info(f"[{session_id}] User: {text}")
     
     # Stop TTS
@@ -313,14 +304,75 @@ async def handle_transcription(text: str, session_id: str):
     # Add to history
     session["conversation_history"].append({"role": "user", "content": text})
     
+    # Build stage context to inject
+    completed_stages = session.get("completed_stages", [])
+    stage_context = ""
+    if completed_stages:
+        stage_context = (
+            f"\n[SYSTEM NOTE: Completed stages: {', '.join(completed_stages)}. "
+            f"Current stage: {session.get('current_stage', 'unknown')}. "
+            f"FORBIDDEN: Do NOT ask 'Am I speaking with {session.get('user_name', 'user')}?' - identity already confirmed. "
+            f"After answering user's question, return ONLY to current stage question.]"
+        )
+    # Inject stage context into user input
+    augmented_input = text
+    if stage_context:
+        augmented_input = text + stage_context
+
     # Get LLM response
     response = await session["llm_service"].generate_response(
-        user_input=text,
+        user_input=augmented_input,
         conversation_history=session["conversation_history"]
     )
     
     ai_text = response["response"].response
     collected_data = response["raw_model_data"]
+
+    # Update stage tracking based on AI response
+    ai_lower = ai_text.lower()
+
+    # Detect which stage just completed based on response content
+    if session["current_stage"] == "identity_check" and any(p in ai_lower for p in ["rohan from brigade", "good time to talk"]):
+        if "identity_check" not in session["completed_stages"]:
+            session["completed_stages"].append("identity_check")
+        session["current_stage"] = "timing_check"
+
+    elif session["current_stage"] == "timing_check" and any(p in ai_lower for p in ["3 bhk or 4 bhk", "looking for 3"]):
+        if "timing_check" not in session["completed_stages"]:
+            session["completed_stages"].append("timing_check")
+            session["completed_stages"].append("intro_said")  # Mark intro as done
+        session["current_stage"] = "bhk_preference"
+
+    elif session["current_stage"] == "bhk_preference" and "how soon" in ai_lower:
+        if "bhk_preference" not in session["completed_stages"]:
+            session["completed_stages"].append("bhk_preference")
+        session["current_stage"] = "urgency_assessment"
+
+    elif session["current_stage"] == "urgency_assessment" and any(p in ai_lower for p in ["visit", "site", "weekend"]):
+        if "urgency_assessment" not in session["completed_stages"]:
+            session["completed_stages"].append("urgency_assessment")
+        session["current_stage"] = "site_visit_scheduling"
+
+    elif "confirmed" in ai_lower and any(p in ai_lower for p in ["visit confirmed", "whatsapp confirmation"]):
+        session["current_stage"] = "post_visit_confirmed"
+        session["call_ended_after_farewell"] = False
+
+    logger.info(f"[{session_id}] Stage: {session['current_stage']} | Completed: {session['completed_stages']}")
+
+    # Fix: Force farewell if user says no more questions
+    no_more_questions_phrases = [
+        "no more questions", "no questions", "that's all", "thats all",
+        "nothing else", "i'm good", "im good", "nope", "no thanks", "no"
+    ]
+    farewell_phrases = ["have a wonderful day", "have a great day", "pleasure speaking"]
+
+    user_done = any(phrase in text.lower() for phrase in no_more_questions_phrases)
+    ai_has_farewell = any(phrase in ai_text.lower() for phrase in farewell_phrases)
+
+    if user_done and not ai_has_farewell:
+        ai_text = "Great! I'll share the floor plans and location on WhatsApp. Pleasure speaking with you. Have a wonderful day!"
+        logger.info(f"[{session_id}] Forced farewell message")
+        session["call_ended"] = True
     
     # Log model usage
     model_used = response.get("model_used", "unknown")
@@ -364,15 +416,26 @@ async def handle_transcription(text: str, session_id: str):
             }
         })
     
+    # Set call_ended flag BEFORE synthesizing if this is farewell
+    current_response_is_farewell = any(phrase in ai_text.lower() for phrase in farewell_phrases)
+
+    if session.get("ending_soon") or response["should_end_call"] or current_response_is_farewell:
+        session["call_ended"] = True
+        logger.info(f"[{session_id}] Call ending - stopping STT immediately")
+        
+        # STOP STT NOW so no more transcriptions come in
+        try:
+            await session["stt_service"].close()
+            logger.info(f"[{session_id}] STT stopped successfully")
+        except Exception as e:
+            logger.warning(f"[{session_id}] STT stop error: {e}")
+
     # Synthesize response
-    await session["tts_service"].synthesize(
-        text=ai_text,
-        send_audio_callback=lambda chunk, action: send_audio_to_exotel(session["websocket"], chunk, action)
-    )
-    
-    # Check if we should end
-    if session.get("ending_soon") or response["should_end_call"]:
-        await asyncio.sleep(2)
+    await session["tts_service"].synthesize(...)
+
+    # End call after TTS completes
+    if session.get("call_ended"):
+        await asyncio.sleep(1)
         await cleanup_session(session_id)
 
 async def send_audio_to_exotel(websocket: WebSocket, audio_chunk, action: str):

@@ -38,8 +38,8 @@ TELEPHONY_PROVIDER = "exotel"  # Fixed for this project
 # LLM Settings
 LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.3"))
 LLM_TOP_P = float(os.getenv("LLM_TOP_P", "0.2"))
-LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "300"))
-LLM_MAX_HISTORY = int(os.getenv("LLM_MAX_HISTORY", "10"))
+LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "200"))
+LLM_MAX_HISTORY = int(os.getenv("LLM_MAX_HISTORY", "3"))
 LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "3"))
 LLM_RETRY_DELAY = int(os.getenv("LLM_RETRY_DELAY", "2"))
 GROQ_URL = os.getenv("GROQ_URL", "https://api.groq.com/openai/v1/chat/completions")
@@ -50,8 +50,8 @@ GROQ_FALLBACK_MODEL = os.getenv("GROQ_FALLBACK_MODEL", "llama-3.1-8b-instant")
 GROQ_USE_FALLBACK = os.getenv("GROQ_USE_FALLBACK", "true").lower() == "true"
 
 # Token optimization
-MAX_CONVERSATION_HISTORY = int(os.getenv("MAX_CONVERSATION_HISTORY", "6"))  # Last 3 exchanges
-MAX_LLM_TOKENS = int(os.getenv("MAX_LLM_TOKENS", "500"))  # Increased to 500 to prevent truncation in non-English JSON
+MAX_CONVERSATION_HISTORY = int(os.getenv("MAX_CONVERSATION_HISTORY", "4"))  # Last 3 exchanges
+MAX_LLM_TOKENS = int(os.getenv("MAX_LLM_TOKENS", "200"))  # Increased to 500 to prevent truncation in non-English JSON
 # STT - Deepgram Settings
 DEEPGRAM_MODEL = os.getenv("DEEPGRAM_MODEL", "nova-3")
 DEEPGRAM_LANGUAGE = os.getenv("DEEPGRAM_LANGUAGE", "en")
@@ -66,7 +66,6 @@ CARTESIA_MODEL_ID = os.getenv("CARTESIA_MODEL_ID", "sonic-english")
 CARTESIA_SPEED = os.getenv("CARTESIA_SPEED", "normal")
 
 # TTS - Sarvam Settings
-SARVAM_LANGUAGE = os.getenv("SARVAM_LANGUAGE", "hi-IN")
 SARVAM_SPEED = float(os.getenv("SARVAM_SPEED", "1.1"))
 SARVAM_TTS_URL = os.getenv("SARVAM_TTS_URL", "https://api.sarvam.ai/text-to-speech")
 
@@ -84,7 +83,7 @@ DEVELOPER_NAME = "Brigade Group"
 KNOWLEDGE_BASE_PATH = "knowledge/brigade_eternia.json"
 
 # Language Configuration
-LANGUAGE = os.getenv("LANGUAGE", "english").lower()
+LANGUAGE = "english"
 
 VOICE_MAPPINGS = {
     "english": {
@@ -94,30 +93,12 @@ VOICE_MAPPINGS = {
         "tts_lang": "en-IN",
         "agent_name": "Rohan",
         "greeting": "Hi, am I speaking with {name}?",
-        "llm_max_tokens": 250
-    },
-    "tamil": {
-        "cartesia_voice_id": os.getenv("VOICE_ID_TAMIL", ""),
-        "sarvam_speaker": "saadhana",
-        "stt_lang": "ta",
-        "tts_lang": "ta-IN",
-        "agent_name": "ரோஹன்",  # Rohan in Tamil
-        "greeting": "ஹலோ, {name} தானே பேசறீங்க?",
-        "llm_max_tokens": 500
-    },
-    "hindi": {
-        "cartesia_voice_id": os.getenv("VOICE_ID_HINDI", ""),
-        "sarvam_speaker": "meera",
-        "stt_lang": "hi",
-        "tts_lang": "hi-IN",
-        "agent_name": "रोहन",  # Rohan in Hindi
-        "greeting": "हेलो, {name} बोल रहे हैं?",
-        "llm_max_tokens": 500
+        "llm_max_tokens": 150
     }
 }
 
 # Current language config
-LANG = VOICE_MAPPINGS.get(LANGUAGE, VOICE_MAPPINGS["english"])
+LANG = VOICE_MAPPINGS["english"]
 STT_LANGUAGE = LANG["stt_lang"]
 TTS_LANGUAGE = LANG["tts_lang"]
 AGENT_NAME = LANG["agent_name"]

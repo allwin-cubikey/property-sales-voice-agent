@@ -39,45 +39,30 @@ DEFAULT_USER_MESSAGE = "Looking for a 3 BHK apartment in Brigade Eternia"
 
 # Dynamic fields for Brigade Eternia site visit flow (matching main.py)
 BRIGADE_ETERNIA_DYNAMIC_FIELDS = {
-    "user_confirmed_identity": {
+    "conversation_stage": {
         "type": "string",
-        "description": "yes or no",
-        "default": "none"
+        "description": "Stage",
+        "default": "identity_check"
     },
-    "wants_site_visit": {
-        "type": "string", 
-        "description": "yes, no, maybe, or none",
-        "default": "none"
-    },
-    "wants_details_first": {
+    "preferred_bhk": {
         "type": "string",
-        "description": "yes or no",
-        "default": "none"  
+        "description": "BHK",
+        "default": "none"
     },
     "visit_date": {
         "type": "string",
-        "description": "Date user wants to visit (e.g., 'Saturday', 'Feb 15')",
+        "description": "Date",
         "default": "none"
     },
     "visit_time": {
         "type": "string",
-        "description": "Time slot (e.g., '10 AM', '3 PM', 'morning', 'evening')",
+        "description": "Time",
         "default": "none"
     },
-    "visit_booking_attempts": {
+    "visit_confirmed": {
         "type": "string",
-        "description": "Number of times asked: 1, 2, 3",
-        "default": "none"
-    },
-    "budget_range": {
-        "type": "string",
-        "description": "Budget interest",
-        "default": "none"
-    },
-    "preferred_bhk": {
-        "type": "string",
-        "description": "3 BHK or 4 BHK",
-        "default": "none"
+        "description": "Confirmed",
+        "default": "no"
     }
 }
 
@@ -85,10 +70,7 @@ BRIGADE_ETERNIA_DYNAMIC_FIELDS = {
 
 # Stop words that trigger graceful shutdown
 STOP_WORDS = [
-    "bye", "goodbye", "thank you", "thanks", "that's all",
-    "no more", "i'm done", "end call", "hang up", "stop",
-    "stop it", "please stop", "stop the call", "that's enough",
-    "no need", "cancel"
+    "end call", "hang up", "stop the call"  # Only hard commands, not conversational
 ]
 
 # Timeout settings
@@ -118,6 +100,7 @@ class LocalVoiceClient:
         self.is_playing = False
         self.is_farewell = False
         self.should_stop = False
+        self.call_ended = False 
         
         self.input_stream = None
         self.output_stream = None
@@ -291,7 +274,14 @@ class LocalVoiceClient:
             while not self.should_stop and self.is_recording:
                 try:
                     # Read audio chunk from microphone
-                    pcm_data = self.input_stream.read(CHUNK_SIZE, exception_on_overflow=False)
+                    try:
+                        pcm_data = self.input_stream.read(CHUNK_SIZE, exception_on_overflow=False)
+                    except IOError as e:
+                        # Handle "Unanticipated host error" (often temporary)
+                        if e.errno == -9999:
+                            await asyncio.sleep(0.1)
+                            continue
+                        raise e
                     
                     # ACOUSTIC FEEDBACK PREVENTION FOR RECORDING:
                     # Only add mic data to the recording buffer if AI is NOT playing.
@@ -363,7 +353,7 @@ class LocalVoiceClient:
     async def check_silence_timeout(self):
         """Monitor silence and auto-shutdown after timeout."""
         try:
-            while not self.should_stop and self.is_recording:
+            while not self.should_stop and self.is_recording and not self.call_ended:
                 await asyncio.sleep(1)
                 
                 if self.is_playing:
@@ -432,31 +422,41 @@ class LocalVoiceClient:
     
     async def graceful_shutdown(self):
         """Gracefully shut down the session."""
+        
+        # Set ALL flags immediately to stop recording/listening
+        self.call_ended = True
+        self.is_farewell = True
+        self.should_stop = True
+        self.is_recording = False
+        logger.info("[LOCAL] Graceful shutdown - all flags set")
+        
         try:
-            print("\\n[SHUTDOWN] Initiating graceful shutdown...")
+            print("\n[SHUTDOWN] Initiating graceful shutdown...")
             
             # Display collected property data
-            print("\\n" + "=" * 60)
+            print("\n" + "=" * 60)
             print("COLLECTED PROPERTY INFORMATION")
             print("=" * 60)
             for key, value in self.collected_data.items():
                 if value and value != "none":
                     print(f"{key.replace('_', ' ').title()}: {value}")
-            print("=" * 60 + "\\n")
+            print("=" * 60 + "\n")
             
-            # Farewell is now handled by LLM in conversation flow (Stage 5)
+            # Save recording if enabled
+            self.save_recording()
             
             await asyncio.sleep(0.5)
-            self.is_recording = False
-            self.save_recording()
-            self.should_stop = True
             
         except Exception as e:
             logger.error(f"[ERROR] Error during graceful shutdown: {e}")
-            self.should_stop = True
     
     async def handle_transcription(self, text: str):
         """Handle transcribed text from STT."""
+
+        if self.call_ended:
+            logger.info("[LOCAL] Ignoring - call already ended")
+            return
+
         try:
             # Handle force stop
             if text == "__FORCE_STOP__":
@@ -518,15 +518,23 @@ class LocalVoiceClient:
             
             async def audio_callback(audio_chunk: bytes, action: str):
                 await self.play_audio(audio_chunk, action)
-            
+
+            # Detect farewell and set flag BEFORE synthesizing
+            farewell_phrases = ["have a wonderful day", "have a great day", "pleasure speaking"]
+            if any(phrase in ai_text.lower() for phrase in farewell_phrases):
+                self.is_farewell = True
+                self.call_ended = True
+                logger.info("[LOCAL] Farewell detected - blocking STT")
+
             await self.tts_service.synthesize(ai_text, audio_callback)
-            
-            print("[LISTENING] Listening for your response...\\n")
-            
-            # Check if should end call
-            if response.get("should_end_call"):
-                print("[END CALL] All information collected")
+
+            # Check if should end call AFTER TTS finishes
+            if response.get("should_end_call") or self.call_ended:
+                print("[END CALL] Call ended after farewell")
                 await self.graceful_shutdown()
+                return
+
+            print("[LISTENING] Listening for your response...\\n")
             
         except Exception as e:
             logger.error(f"[ERROR] Error handling transcription: {e}", exc_info=True)

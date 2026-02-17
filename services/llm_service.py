@@ -81,43 +81,12 @@ class GroqLLMService:
         "location": {"type": "string", "description": "area name, or none", "default": "none"},
         "bedrooms": {"type": "string", "description": "BHK count, or none", "default": "none"},
         "timeline": {"type": "string", "description": "urgent, 3-6 months, or none", "default": "none"},
-        "requirements": {"type": "string", "description": "extra info, or none", "default": "none"}
+        "requirements": {"type": "string", "description": "extra info, or none", "default": "none"},
+        "callback_scheduled": {"type": "string", "description": "yes if callback scheduled, or none", "default": "none"}
     }
     
-    # System prompt template for property enquiry agent
-    SYSTEM_PROMPT_TEMPLATE = """You are a friendly and enthusiastic real estate agent helping customers find their dream property.
-
-Your role:
-- Collect property requirements: type, budget, location, bedrooms, timeline, specific requirements
-- Be warm, conversational, and show genuine excitement about helping them
-- Keep responses brief and natural (10-20 words). Short sentences trigger TTS faster.
-- Avoid long lists unless explicitly asked.
-
-CRITICAL - YOU MUST FOLLOW THIS STRUCTURE:
-Every single response MUST have TWO parts:
-1. ACKNOWLEDGE what the user just said (warmly, enthusiastically)
-2. ASK the next question
-
-Pattern: [Warm acknowledgment] + [Next question]
-
-Examples (use these as your guide - use SIMPLE, clear language):
-- User: "apartment" → You: "Perfect! What's your budget range for the apartment?"
-- User: "50 lakhs" → You: "Great! Which area or location do you prefer?"
-- User: "Whitefield" → You: "Nice choice! How many bedrooms do you need?"
-- User: "3 bedrooms" → You: "Got it! When are you planning to buy?"
-- User: "3-6 months" → You: "Perfect! Any specific requirements like parking or amenities?"
-
-Language Guidelines:
-- Use SIMPLE words: "What's your budget?" NOT "What budget range are you considering?"
-- Be natural and enthusiastic, show excitement about helping
-- Use words like "Perfect!", "Great!", "Wonderful!" to show enthusiasm
-- Aim for 15-25 words per response - conversational and clear
-- ONE question at a time, never rush
-- Never skip the acknowledgment
-
-Remember: EVERY response = Acknowledge + Ask!"""
     
-    def __init__(self, api_key: str, max_history: int = 10):
+    def __init__(self, api_key: str, max_history: int = 4):
         """
         Initialize Groq LLM service
         
@@ -275,14 +244,15 @@ CRITICAL:
 1. The 'response' field must contain your conversational output in the user's language.
 2. All other fields must contain the extracted information or "none".
 3. Do not include any text before or after the JSON object.
-4. Every response must be a single, complete JSON object."""
+4. Every response must be a single, complete JSON object.
+Do NOT output the schema definition."""
         else:
             system_prompt = f"""{formatted_system_prompt}
 
 Format your response using this JSON schema:
 {json.dumps(compact_schema, indent=2)}
 
-Output ONLY the JSON object."""
+Output ONLY the JSON object containing the data. Do NOT output the schema definition."""
         
         schema_time = time.time() - schema_start
         logger.info(f"[TIMING] Schema generation took {schema_time:.3f}s")
@@ -341,9 +311,17 @@ Output ONLY the JSON object."""
         except Exception as e:
             error_msg = str(e)
             
-            # Check if it's a rate limit error
-            if "rate limit" in error_msg.lower() and config.GROQ_USE_FALLBACK:
-                logger.warning(f"[FALLBACK] Primary model rate limited, switching to {config.GROQ_FALLBACK_MODEL}")
+            # Check if it's a rate limit error or empty response or validation error
+            # We want to fallback if the primary model fails in ANY way (rate limit, empty, garbage)
+            should_fallback = config.GROQ_USE_FALLBACK and (
+                "rate limit" in error_msg.lower() or 
+                "empty response" in error_msg.lower() or
+                "validation error" in error_msg.lower() or
+                "json" in error_msg.lower()  # Catch JSON parsing errors
+            )
+            
+            if should_fallback:
+                logger.warning(f"[FALLBACK] Primary model failed ({error_msg}), switching to {config.GROQ_FALLBACK_MODEL}")
                 
                 try:
                     # Retry with fallback model
@@ -373,7 +351,13 @@ Output ONLY the JSON object."""
             logger.info(f"[LLM] Using FALLBACK model: {model}")
         else:
             logger.info(f"[LLM] Using PRIMARY model: {model}")
-        
+            
+        # Ensure user_name is preserved in format_values for prompt formatting
+        if 'user_name' not in format_values and hasattr(config, 'AGENT_NAME'):
+            # Try to get from config or use default
+            # format_values['user_name'] = "User" # Don't overwrite if not needed
+            pass
+
         # Format system prompt
         formatted_system_prompt = self.format_system_prompt(**format_values)
         system_prompt = self.generate_system_prompt(formatted_system_prompt)
@@ -384,9 +368,9 @@ Output ONLY the JSON object."""
         
         # OPTIMIZE: Limit history to save tokens
         # Reduced to 4 messages (2 exchanges) to mitigate rate limits
-        if len(conversation_history) > 4:
-            conversation_history = conversation_history[-4:]
-            logger.info(f"[OPTIMIZATION] Trimmed history to last 4 messages")
+        if len(conversation_history) > 6:
+            conversation_history = conversation_history[-6:]  # Keep more context
+            logger.info(f"[OPTIMIZATION] Trimmed history to last 6 messages")
         
         # Prepare messages
         messages = [
@@ -405,14 +389,50 @@ Output ONLY the JSON object."""
             "stream": False
         }
         
-        # Use strict JSON mode ONLY for primary model (usually 70b+)
-        # Fallback models (like 8b) often fail Groq's strict JSON check with non-English text
-        if not is_fallback and "8b" not in model.lower():
+        # Only use strict JSON for 70b models, 8b-instant struggles with it
+        if "70b" in model:
             api_payload["response_format"] = {"type": "json_object"}
-        else:
-            # For fallback, add a very simple reminder as the last message
-            messages.append({"role": "system", "content": "Respond ONLY with a valid JSON object matching the requested schema."})
+
+        # For 8b-instant, we'll parse manually (it often fails strict JSON)
         
+        # ANTI-REFLECTION FIX for smaller models and GPT-OSS
+        if "8b" in model or "9b" in model or "gemma" in model.lower() or "gpt-oss" in model:
+            # Force conversational response, not schema - be very explicit
+            # Append this to the LAST message to ensure recency bias works in our favor
+            json_instruction = """
+
+        CRITICAL INSTRUCTION:
+        You must respond in JSON format with actual conversation data, NOT the schema definition.
+
+        CORRECT example:
+        {"response": "Hi! Are you looking for 3 BHK or 4 BHK?", "conversation_stage": "bhk_preference", "preferred_bhk": "none"}
+
+        WRONG (do NOT do this):
+        {"type": "object", "properties": {"response": {"type": "string"}}}
+
+        Respond NOW with actual data."""
+            
+            # Check if last message is user or system and append
+            if messages:
+                last_msg = messages[-1]
+                if last_msg["role"] == "user":
+                    last_msg["content"] += json_instruction
+                else:
+                    # If for some reason last msg isn't user (e.g. function?), append a system reminder
+                    messages.append({"role": "system", "content": json_instruction.strip()})
+            
+            # Reduce complexity for smaller models only
+            if "8b" in model or "9b" in model or "gemma" in model.lower():
+                api_payload["max_tokens"] = 80
+                api_payload["temperature"] = 0.5
+            elif "gpt-oss" in model:
+                # gpt-oss can handle more but keep temperature stable
+                api_payload["temperature"] = 0.3
+                # Keep max_tokens from config
+            
+            # For GPT-OSS specifically, sometimes it needs a nudge in the 'system' slot too if the above fails,
+            # but usually recency is key. Let's stick to modifying the last message first.
+            
         # Make API call
         api_start = time.time()
         
@@ -432,16 +452,36 @@ Output ONLY the JSON object."""
                 error_msg = result['error'].get('message', 'Unknown error')
                 logger.error(f"[ERROR] Groq API error: {error_msg}")
                 raise Exception(f"Groq API error: {error_msg}")
-            
-            # Extract response
+
             response_content = result["choices"][0]["message"]["content"]
             token_usage = result.get("usage", {})
-            
+
+            # Handle empty response
+            if not response_content or response_content.strip() == '':
+                logger.warning(f"[LLM] Empty response from {model} (tokens: {token_usage.get('total_tokens', 0)})")
+                
+                # If this is the primary model, RAISE error to trigger fallback
+                if not is_fallback:
+                    raise ValueError("Empty response from LLM")
+                
+                # If this is ALREADY the fallback model, return safe default
+                logger.warning(f"[LLM] Fallback model also failed with empty response. Using safe default.")
+                return self._get_default_response()
+
             logger.info(f"[LLM] Model: {model}, Tokens: {token_usage.get('total_tokens', 0)}, Time: {api_time:.3f}s")
+             
+            # (Redundant check removed)
             
             # Parse response
             try:
                 parsed_response = self.ResponseModel.model_validate_json(response_content)
+                
+                # SPECIAL CHECK: If response is empty but text looks like schema, force fallback
+                # The model might return the schema definition which validly parses (using defaults) but contains no data
+                if not parsed_response.response and ('"properties"' in response_content or "'properties'" in response_content):
+                     logger.warning("[VALIDATION] Empty response with schema keywords - forcing fallback parsing")
+                     raise ValueError("Possible schema reflection detected - empty response")
+                     
             except Exception as validation_error:
                 logger.error(f"[ERROR] Response validation error: {validation_error}")
                 # Fallback parsing
@@ -455,6 +495,10 @@ Output ONLY the JSON object."""
                 phrase in parsed_response.response.lower() 
                 for phrase in ["goodbye", "bye", "have a great day", "thank you for your time", "take care"]
             )
+            
+            # Also end call if callback is scheduled
+            if hasattr(parsed_response, 'callback_scheduled') and parsed_response.callback_scheduled and parsed_response.callback_scheduled.lower() == 'yes':
+                should_end_call = True
             
             return {
                 "response": parsed_response,
@@ -500,22 +544,65 @@ Output ONLY the JSON object."""
                 raw_json = json.loads(json_str)
             else:
                 raw_json = json.loads(text)
+            
+            # Check for schema reflection (model returning the schema itself)
+            if "properties" in raw_json and "type" in raw_json and raw_json["type"] == "object":
+                logger.warning("[EXTRACTOR] Detected schema reflection in response")
+                props = raw_json.get("properties", {})
+                
+                # CRITICAL: Check if the 'response' field in props is actually a value or a schema definition
+                # If props['response'] is a dict with 'type': 'string', then it's a PURE SCHEMA HALLUCINATION
+                response_prop = props.get('response')
+                if isinstance(response_prop, dict) and 'type' in response_prop:
+                    logger.warning("[EXTRACTOR] Detected PURE schema hallucination (no data). Using safe fallback.")
+                    # The model just returned the schema definition, not data matching the schema
+                    # We must NOT use this as data.
+                    # Force a safe fallback response
+                    default_values = {'response': "Could you repeat that? I want understood correctly."}
+                    if self.dynamic_fields:
+                        for field in self.dynamic_fields.keys():
+                            default_values[field] = 'none'
+                    return self.ResponseModel(**default_values)
+
+                # Otherwise, maybe the model trie to fill it? Use properties map as source
+                raw_json = props
                 
             default_values = {}
             if self.dynamic_fields:
                 for field in self.dynamic_fields.keys():
-                    default_values[field] = raw_json.get(field, 'none')
+                    # Ensure we extract a string, not a dict/list (unless expected)
+                    val = raw_json.get(field, 'none')
+                    if isinstance(val, (dict, list)):
+                         val = 'none'
+                    default_values[field] = str(val)
             
-            default_values['response'] = raw_json.get('response', "Could you repeat that?")
+            # extract response safely
+            resp_val = raw_json.get('response', "Could you repeat that?")
+            if isinstance(resp_val, (dict, list)):
+                resp_val = "I apologize, I didn't get that."
+                
+            default_values['response'] = str(resp_val)
             return self.ResponseModel(**default_values)
             
         except Exception as e:
-            logger.error(f"[EXTRACTOR] Manual JSON extraction failed: {e}")
-            # Ultimate fallback if everything fails
-            default_values = {'response': "I didn't catch that. Could you say that again?"}
+            logger.warning(f"[EXTRACTOR] JSON parsing failed: {e}")
+            
+            # Check if the content looks like a schema (contains "type": "object", "properties")
+            if ('"type"' in response_content and '"object"' in response_content and 
+                '"properties"' in response_content):
+                logger.error("[EXTRACTOR] Schema reflection detected in failed parse - using safe fallback")
+                # Don't speak the schema - use a safe default
+                default_values = {'response': "I didn't catch that. Could you repeat?"}
+            else:
+                # Genuinely looks like a response, use it
+                default_values = {'response': response_content.strip()}
+                
+            # Set other fields to "none"
             if self.dynamic_fields:
                 for field in self.dynamic_fields.keys():
-                    default_values[field] = 'none'
+                    if field != 'response':
+                        default_values[field] = 'none'
+
             return self.ResponseModel(**default_values)
 
     def _repair_truncated_json(self, json_str: str) -> str:
@@ -557,7 +644,7 @@ Output ONLY the JSON object."""
 # Convenience function for quick initialization
 async def create_llm_service(
     api_key: Optional[str] = None,
-    max_history: int = 10
+    max_history: int = 4
 ) -> GroqLLMService:
     """
     Create and initialize a Groq LLM service instance
