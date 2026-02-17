@@ -7,6 +7,7 @@ without telephony integration for the Property Enquiry Agent.
 import asyncio
 import logging
 import pyaudio
+import audioop
 import signal
 import sys
 import wave
@@ -100,7 +101,10 @@ class LocalVoiceClient:
         self.is_playing = False
         self.is_farewell = False
         self.should_stop = False
-        self.call_ended = False 
+        self.call_ended = False
+        self.is_user_speaking = False
+        self.interruption_threshold = 800  # Tune: increase if false triggers, decrease if not triggering
+
         
         self.input_stream = None
         self.output_stream = None
@@ -289,14 +293,33 @@ class LocalVoiceClient:
                     if not self.is_playing:
                         self.add_to_recording(pcm_data)
                     
+                    import audioop
+
                     # Convert PCM to mulaw for STT
                     mulaw_data = pcm_to_mulaw(pcm_data, width=2)
-                    
-                    # ACOUSTIC FEEDBACK PREVENTION:
-                    # Only send audio to STT when AI is NOT speaking
-                    if not self.is_playing and not self.is_farewell:
-                        if self.stt_service:
-                            await self.stt_service.process_audio(mulaw_data)
+
+                    if not self.is_farewell:
+                        if not self.is_playing:
+                            # Normal listening - always send to STT
+                            if self.stt_service:
+                                await self.stt_service.process_audio(mulaw_data)
+                        else:
+                            # Agent speaking - check if user is interrupting
+                            rms = audioop.rms(pcm_data, 2)
+                            if rms > self.interruption_threshold:
+                                if not self.is_user_speaking:
+                                    self.is_user_speaking = True
+                                    logger.info(f"[INTERRUPT] User voice detected RMS:{rms} - stopping TTS immediately")
+                                    
+                                    # STOP TTS RIGHT NOW - don't wait for transcription
+                                    self.is_playing = False
+                                    if self.tts_service:
+                                        await self.tts_service.stop()
+                                
+                                if self.stt_service:
+                                    await self.stt_service.process_audio(mulaw_data)
+                            else:
+                                self.is_user_speaking = False
                     
                     # Small sleep to prevent CPU overload
                     await asyncio.sleep(0.001)
@@ -470,7 +493,18 @@ class LocalVoiceClient:
             
             if not text or len(text.strip()) == 0:
                 return
-            
+
+            # INTERRUPTION HANDLING
+            if self.is_playing:
+                if self.is_user_speaking:
+                    logger.info("[INTERRUPT] Confirmed user interruption - stopping TTS")
+                    self.is_playing = False
+                    self.is_user_speaking = False
+                    await self.tts_service.stop()
+                    await asyncio.sleep(0.2)
+                else:
+                    logger.info("[INTERRUPT] Ignoring echo transcription")
+                    return
             # Update last speech time
             self.last_user_speech_time = datetime.now().timestamp()
             
