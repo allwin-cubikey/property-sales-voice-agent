@@ -86,25 +86,52 @@ class SarvamTTSService(BaseTTSService):
             "enable_preprocessing": True,
             "model": self.model or config.SARVAM_MODEL
         }
-        try:
-            async with self._session.post(url, json=payload, headers=headers) as response:
-                if response.status != 200:
-                    error_text = await response.text()
-                    logger.error(f"[ERROR] Sarvam API error {response.status}: {error_text}")
+        
+        # Retry once on failure
+        for attempt in range(2):
+            try:
+                if self._session is None or self._session.closed:
+                    logger.warning("[TTS] Cannot synthesize chunk: session is closed")
                     return None
-                
-                data = await response.json()
-                if "audios" in data and len(data["audios"]) > 0:
-                    raw_audio = base64.b64decode(data["audios"][0])
-                    # Strip WAV header if present (RIFF....WAVE)
-                    if raw_audio[:4] == b'RIFF' and raw_audio[8:12] == b'WAVE':
-                        logger.debug("[TTS] Stripping WAV header (44 bytes)")
-                        return raw_audio[44:]
-                    return raw_audio
+                    
+                # Increased timeout to 30s to handle potential cold starts or network latency
+                timeout = aiohttp.ClientTimeout(total=30)
+                logger.debug(f"[TTS] Sending request to {url} with len(text)={len(payload['text'])}")
+                async with self._session.post(url, json=payload, headers=headers, timeout=timeout) as response:
+                    if response.status != 200:
+                        error_text = await response.text()
+                        logger.error(f"[ERROR] Sarvam API error {response.status}: {error_text[:200]}")
+                        logger.error(f"[ERROR] Payload was: speaker={payload['speaker']}, lang={payload['target_language_code']}, model={payload['model']}")
+                        if attempt == 0:
+                            await asyncio.sleep(0.5)
+                            continue
+                        return None
+                    
+                    data = await response.json()
+                    if "audios" in data and len(data["audios"]) > 0:
+                        raw_audio = base64.b64decode(data["audios"][0])
+                        # Strip WAV header if present (RIFF....WAVE)
+                        if raw_audio[:4] == b'RIFF' and raw_audio[8:12] == b'WAVE':
+                            logger.debug("[TTS] Stripping WAV header (44 bytes)")
+                            return raw_audio[44:]
+                        return raw_audio
+                    logger.warning(f"[TTS] No audio in response for: '{text[:50]}...'")
+                    return None
+            except asyncio.TimeoutError:
+                logger.error(f"[ERROR] Sarvam TTS timeout (attempt {attempt+1}): '{text[:40]}...'")
+                if attempt == 0:
+                    continue
                 return None
-        except Exception as e:
-            logger.error(f"[ERROR] Chunk synthesis failed: {e}")
-            return None
+            except Exception as e:
+                if not self._is_stopped:
+                    logger.error(f"[ERROR] Chunk synthesis failed ({type(e).__name__}): {e}")
+                else:
+                    logger.debug(f"[TTS] Chunk synthesis interrupted during shutdown: {e}")
+                if attempt == 0 and not self._is_stopped:
+                    await asyncio.sleep(0.3)
+                    continue
+                return None
+        return None
 
     async def synthesize(
         self, 
@@ -254,17 +281,25 @@ class SarvamTTSService(BaseTTSService):
         
         # PRODUCER: Parallel Fetching
         async def producer():
-            # Launch all requests concurrently
+            # Launch requests one at a time - check stop before each
             tasks = []
             for i, segment in enumerate(final_segments):
+                if self._is_stopped:
+                    logger.info(f"[TTS] Producer stopped before segment {i+1}")
+                    break
                 logger.info(f"[TTS] Launching request {i+1}/{len(final_segments)}: '{segment[:30]}...'")
                 tasks.append(asyncio.create_task(self._synthesize_chunk(segment)))
-            
+
             # Await them in order (to preserve playback sequence)
             for i, task in enumerate(tasks):
                 if self._is_stopped:
+                    # Cancel all remaining tasks immediately
+                    task.cancel()
+                    for remaining in tasks[i+1:]:
+                        remaining.cancel()
+                    logger.info(f"[TTS] Cancelled remaining {len(tasks)-i} segments")
                     break
-                
+
                 try:
                     audio_data = await task
                     if audio_data:
@@ -272,9 +307,12 @@ class SarvamTTSService(BaseTTSService):
                         await audio_queue.put(audio_data)
                     else:
                         logger.warning(f"[TTS] Failed to synthesize segment {i+1}")
+                except asyncio.CancelledError:
+                    logger.info(f"[TTS] Segment {i+1} cancelled")
+                    break
                 except Exception as e:
                     logger.error(f"[TTS] Error awaiting segment {i+1}: {e}")
-            
+
             await audio_queue.put(None)
             logger.info("[TTS] Producer finished")
 

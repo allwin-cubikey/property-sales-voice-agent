@@ -11,6 +11,7 @@ from pydantic import BaseModel
 
 import config
 import prompts
+from prompts import STAGE_DEFINITIONS
 from services.stt_factory import STTServiceFactory
 from services.tts_factory import TTSServiceFactory
 from services.llm_service import GroqLLMService
@@ -34,30 +35,46 @@ storage = EnquiryStorage(config.ENQUIRIES_FILE)
 telephony_service = None
 
 # Dynamic fields for Brigade Eternia site visit flow
+# NOTE: conversation_stage removed — backend is sole authority on stage
 BRIGADE_ETERNIA_DYNAMIC_FIELDS = {
-    "conversation_stage": {
+    "intent": {
         "type": "string",
-        "description": "Stage",
-        "default": "identity_check"
+        "description": "Intent classification",
+        "default": "flow_progress"
+    },
+    "assistant_text": {
+        "type": "string",
+        "description": "Spoken response text",
+        "default": ""
     },
     "preferred_bhk": {
         "type": "string",
-        "description": "BHK",
+        "description": "BHK preference",
         "default": "none"
     },
     "visit_date": {
         "type": "string",
-        "description": "Date",
+        "description": "Visit date",
         "default": "none"
     },
     "visit_time": {
         "type": "string",
-        "description": "Time",
+        "description": "Visit time",
         "default": "none"
     },
     "visit_confirmed": {
         "type": "string",
-        "description": "Confirmed",
+        "description": "Visit confirmed",
+        "default": "no"
+    },
+    "callback_scheduled": {
+        "type": "string",
+        "description": "Callback scheduled",
+        "default": "no"
+    },
+    "end_call": {
+        "type": "string",
+        "description": "End call flag",
         "default": "no"
     }
 }
@@ -244,15 +261,10 @@ async def initialize_call_session(session_id: str, websocket: WebSocket):
     )
     await tts_service.initialize()
     
-    # Get system prompt
-    system_prompt = prompts.get_formatted_prompt(
-        user_name=form_data["name"],
-        user_message=form_data["message"]
-    )
-    
+    # Pass raw prompt template — runtime context (stage, slots) formatted per-turn
     await llm_service.initialize(
         dynamic_fields=BRIGADE_ETERNIA_DYNAMIC_FIELDS,
-        system_prompt_template=system_prompt
+        system_prompt_template=prompts.BRIGADE_ETERNIA_SYSTEM_PROMPT
     )
     
     active_sessions[session_id] = {
@@ -264,9 +276,16 @@ async def initialize_call_session(session_id: str, websocket: WebSocket):
         "conversation_history": [],
         "start_time": datetime.now(),
         "enquiry_data": enquiry,
-        "completed_stages": [],       # Track what's done
-        "current_stage": "identity_check",  # Track current stage
-        "call_ended": False
+        "completed_stages": [],
+        "current_stage": "identity_check",
+        "call_ended": False,
+        "slots": {
+            "preferred_bhk": None,
+            "visit_date": None,
+            "visit_time": None,
+            "visit_confirmed": "no",
+            "callback_scheduled": "no"
+        }
     }
     
     # Send greeting with first name only
@@ -304,60 +323,91 @@ async def handle_transcription(text: str, session_id: str):
     # Add to history
     session["conversation_history"].append({"role": "user", "content": text})
     
-    # Build stage context to inject
+    # STEP 1: Backend state machine — update stage based on user input
+    text_lower = text.lower()
     completed_stages = session.get("completed_stages", [])
-    stage_context = ""
-    if completed_stages:
-        stage_context = (
-            f"\n[SYSTEM NOTE: Completed stages: {', '.join(completed_stages)}. "
-            f"Current stage: {session.get('current_stage', 'unknown')}. "
-            f"FORBIDDEN: Do NOT ask 'Am I speaking with {session.get('user_name', 'user')}?' - identity already confirmed. "
-            f"After answering user's question, return ONLY to current stage question.]"
-        )
-    # Inject stage context into user input
-    augmented_input = text
-    if stage_context:
-        augmented_input = text + stage_context
+    current_stage = session.get("current_stage", "identity_check")
+    user_name = session.get("enquiry_data", {}).get("form_data", {}).get("name", "there")
+    first_name = user_name.strip().split()[0] if user_name else "there"
 
-    # Get LLM response
+    if current_stage == "identity_check":
+        if any(p in text_lower for p in ["yes", "speaking", "this is", "yeah", "yep",
+                          "i am", "iam", "sir", "ji", "haan", "correct",
+                          "right", "that's me", "thats me"]):
+            if "identity_check" not in completed_stages:
+                completed_stages.append("identity_check")
+            current_stage = "timing_check"
+
+    elif current_stage == "timing_check":
+        positive = ["yes", "yeah", "sure", "go ahead", "yep", "okay", "ok", "fine",
+            "absolutely", "sir", "ji", "haan", "please", "of course",
+            "why not", "definitely", "good time", "go on"]
+        negative = ["no", "not now", "busy", "later", "call back", "bad time"]
+        if any(p in text_lower for p in positive) and not any(p in text_lower for p in negative):
+            if "timing_check" not in completed_stages:
+                completed_stages.append("timing_check")
+            current_stage = "bhk_preference"
+
+    elif current_stage == "bhk_preference":
+        if any(p in text_lower for p in ["3 bhk", "3bhk", "three bhk", "three bedroom",
+                          "three", "3 bed", "4 bhk", "4bhk", "four bhk",
+                          "four bedroom", "four", "4 bed"]):
+            if "bhk_preference" not in completed_stages:
+                completed_stages.append("bhk_preference")
+            current_stage = "urgency_assessment"
+
+    elif current_stage == "urgency_assessment":
+        if len(text_lower.strip()) > 2:
+            if "urgency_assessment" not in completed_stages:
+                completed_stages.append("urgency_assessment")
+            current_stage = "site_visit_scheduling"
+
+    elif current_stage == "site_visit_scheduling":
+        if any(p in text_lower for p in ["tomorrow", "today", "weekend", "monday", "tuesday",
+                                        "wednesday", "thursday", "friday", "saturday", "sunday",
+                                        "morning", "evening", "afternoon", "night", "next week"]):
+            current_stage = "post_visit_confirmed"
+
+    session["completed_stages"] = completed_stages
+    session["current_stage"] = current_stage
+    logger.info(f"[{session_id}] Stage: {current_stage} | Completed: {completed_stages}")
+
+    # STEP 2: Build clean runtime context
+    stage_info = STAGE_DEFINITIONS.get(current_stage, STAGE_DEFINITIONS["identity_check"])
+    slots = session.get("slots", {})
+    
+    # Build format values for prompt template
+    format_values = {
+        "user_name": first_name,
+        "user_message": text,
+        "current_stage": current_stage,
+        "stage_goal": stage_info["goal"],
+        "slots": json.dumps(slots),
+        "current_date": datetime.now().strftime("%B %d, %Y")
+    }
+
+    # STEP 3: Get LLM response with clean user text
     response = await session["llm_service"].generate_response(
-        user_input=augmented_input,
-        conversation_history=session["conversation_history"]
+        user_input=text,
+        conversation_history=session["conversation_history"],
+        format_values=format_values
     )
     
-    ai_text = response["response"].response
-    collected_data = response["raw_model_data"]
+    # STEP 4: Extract response using new schema
+    ai_text = response.get("spoken_text", "")
+    intent = response.get("intent", "unknown")
+    collected_data = response.get("raw_model_data", {})
 
-    # Update stage tracking based on AI response
-    ai_lower = ai_text.lower()
+    if not ai_text or not ai_text.strip():
+        logger.error(f"[{session_id}] Empty response from LLM")
+        ai_text = "I'm sorry, I didn't quite get that. Could you please repeat?"
 
-    # Detect which stage just completed based on response content
-    if session["current_stage"] == "identity_check" and any(p in ai_lower for p in ["rohan from brigade", "good time to talk"]):
-        if "identity_check" not in session["completed_stages"]:
-            session["completed_stages"].append("identity_check")
-        session["current_stage"] = "timing_check"
-
-    elif session["current_stage"] == "timing_check" and any(p in ai_lower for p in ["3 bhk or 4 bhk", "looking for 3"]):
-        if "timing_check" not in session["completed_stages"]:
-            session["completed_stages"].append("timing_check")
-            session["completed_stages"].append("intro_said")  # Mark intro as done
-        session["current_stage"] = "bhk_preference"
-
-    elif session["current_stage"] == "bhk_preference" and "how soon" in ai_lower:
-        if "bhk_preference" not in session["completed_stages"]:
-            session["completed_stages"].append("bhk_preference")
-        session["current_stage"] = "urgency_assessment"
-
-    elif session["current_stage"] == "urgency_assessment" and any(p in ai_lower for p in ["visit", "site", "weekend"]):
-        if "urgency_assessment" not in session["completed_stages"]:
-            session["completed_stages"].append("urgency_assessment")
-        session["current_stage"] = "site_visit_scheduling"
-
-    elif "confirmed" in ai_lower and any(p in ai_lower for p in ["visit confirmed", "whatsapp confirmation"]):
-        session["current_stage"] = "post_visit_confirmed"
-        session["call_ended_after_farewell"] = False
-
-    logger.info(f"[{session_id}] Stage: {session['current_stage']} | Completed: {session['completed_stages']}")
+    # STEP 5: Update slots from LLM output
+    for slot_key in slots:
+        val = collected_data.get(slot_key)
+        if val and val != "none" and val != "null":
+            slots[slot_key] = val
+    session["slots"] = slots
 
     # Fix: Force farewell if user says no more questions
     no_more_questions_phrases = [
@@ -381,19 +431,19 @@ async def handle_transcription(text: str, session_id: str):
     if was_fallback:
         model_info += " [FALLBACK]"
     
-    logger.info(f"[{session_id}] AI{model_info}: {ai_text}")
-    logger.info(f"[{session_id}] Collected: {collected_data}")
+    logger.info(f"[{session_id}] AI ({intent}){model_info}: {ai_text}")
+    logger.info(f"[{session_id}] Slots: {slots}")
     
     # Check if site visit booked
-    if collected_data.get("visit_date") != "none" and collected_data.get("visit_time") != "none":
-        logger.info(f"[{session_id}] Site visit booked: {collected_data['visit_date']} at {collected_data['visit_time']}")
+    if slots.get("visit_date") and slots["visit_date"] != "none" and \
+       slots.get("visit_time") and slots["visit_time"] != "none":
+        logger.info(f"[{session_id}] Site visit booked: {slots['visit_date']} at {slots['visit_time']}")
         
-        # Mark as success
         await storage.update_enquiry(session_id, {
             "status": "site_visit_booked",
             "visit_scheduled": {
-                "date": collected_data["visit_date"],
-                "time": collected_data["visit_time"]
+                "date": slots["visit_date"],
+                "time": slots["visit_time"]
             },
             "call_data": {
                 "collected_info": collected_data,
@@ -401,13 +451,12 @@ async def handle_transcription(text: str, session_id: str):
             }
         })
         
-        # This will be the final message, end call after TTS
         session["ending_soon"] = True
     
     # Add to history
     session["conversation_history"].append({"role": "assistant", "content": ai_text})
     
-    # Save collected data (if not already saved above)
+    # Save collected data
     if not session.get("ending_soon"):
         await storage.update_enquiry(session_id, {
             "call_data": {
@@ -423,7 +472,6 @@ async def handle_transcription(text: str, session_id: str):
         session["call_ended"] = True
         logger.info(f"[{session_id}] Call ending - stopping STT immediately")
         
-        # STOP STT NOW so no more transcriptions come in
         try:
             await session["stt_service"].close()
             logger.info(f"[{session_id}] STT stopped successfully")
@@ -431,7 +479,10 @@ async def handle_transcription(text: str, session_id: str):
             logger.warning(f"[{session_id}] STT stop error: {e}")
 
     # Synthesize response
-    await session["tts_service"].synthesize(...)
+    await session["tts_service"].synthesize(
+        text=ai_text,
+        send_audio_callback=lambda chunk, action: send_audio_to_exotel(session["websocket"], chunk, action)
+    )
 
     # End call after TTS completes
     if session.get("call_ended"):

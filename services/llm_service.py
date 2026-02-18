@@ -55,11 +55,13 @@ class DynamicModelGenerator:
                     Field(default=default, description=description)
                 )
         
-        # Always add response field for conversational output
-        model_fields['response'] = (
-            str, 
-            Field(default='', description='Conversational response to the user')
-        )
+        # NOTE: 'assistant_text' is the conversational output field in the new schema
+        # Only add default 'response' field if neither 'response' nor 'assistant_text' is in dynamic_fields
+        if 'response' not in model_fields and 'assistant_text' not in model_fields:
+            model_fields['response'] = (
+                str, 
+                Field(default='', description='Conversational response to the user')
+            )
         
         # Dynamically create the model
         model = create_model(base_model_name, __base__=BaseModel, **model_fields)
@@ -75,14 +77,49 @@ class GroqLLMService:
     """
     
     # Define dynamic fields for property information extraction
+    # NOTE: conversation_stage removed — backend is sole authority on stage
+    # 'response' field renamed to 'assistant_text' for voice output
     PROPERTY_INFO_FIELDS = {
-        "property_type": {"type": "string", "description": "apartment, villa, plot, commercial, or none", "default": "none"},
-        "budget_range": {"type": "string", "description": "budget like '20-30 lakhs', or none", "default": "none"},
-        "location": {"type": "string", "description": "area name, or none", "default": "none"},
-        "bedrooms": {"type": "string", "description": "BHK count, or none", "default": "none"},
-        "timeline": {"type": "string", "description": "urgent, 3-6 months, or none", "default": "none"},
-        "requirements": {"type": "string", "description": "extra info, or none", "default": "none"},
-        "callback_scheduled": {"type": "string", "description": "yes if callback scheduled, or none", "default": "none"}
+        "intent": {
+            "type": "string",
+            "description": "Intent classification",
+            "default": "flow_progress"
+        },
+        "assistant_text": {
+            "type": "string",
+            "description": "Spoken response text",
+            "default": ""
+        },
+        "preferred_bhk": {
+            "type": "string",
+            "description": "BHK preference",
+            "default": "none"
+        },
+        "visit_date": {
+            "type": "string",
+            "description": "Visit date",
+            "default": "none"
+        },
+        "visit_time": {
+            "type": "string",
+            "description": "Visit time",
+            "default": "none"
+        },
+        "visit_confirmed": {
+            "type": "string",
+            "description": "Visit confirmed",
+            "default": "no"
+        },
+        "callback_scheduled": {
+            "type": "string",
+            "description": "Callback scheduled",
+            "default": "no"
+        },
+        "end_call": {
+            "type": "string",
+            "description": "End call flag",
+            "default": "no"
+        }
     }
     
     
@@ -201,58 +238,16 @@ class GroqLLMService:
     
     def generate_system_prompt(self, formatted_system_prompt: str) -> str:
         """
-        Generate complete system prompt with JSON schema for structured output
+        Generate complete system prompt with JSON schema for structured output.
         
-        Args:
-            formatted_system_prompt: The formatted base system prompt
-            
-        Returns:
-            Complete system prompt with JSON schema
+        The new prompt already defines the output format inline, so we only
+        need to append a compact field reminder for the model.
         """
         schema_start = time.time()
         
-        # Get JSON schema from Pydantic model
-        json_schema = self.ResponseModel.model_json_schema()
-        
-        # Create compact schema
-        compact_schema = {
-            "type": "object",
-            "properties": {}
-        }
-        
-        # Add each field with type and description
-        for field_name, field_schema in json_schema.get("properties", {}).items():
-            compact_schema["properties"][field_name] = {
-                "type": field_schema.get("type", "string"),
-                "description": field_schema.get("description", "")
-            }
-        
-        # Required fields
-        required_fields = ["response"]
-        if self.dynamic_fields:
-            required_fields = list(self.dynamic_fields.keys()) + ["response"]
-        compact_schema["required"] = required_fields
-        
-        # Create prompt based on whether we have fields to extract
-        if self.dynamic_fields:
-            system_prompt = f"""{formatted_system_prompt}
-
-You MUST only respond with a valid JSON object matching this schema:
-{json.dumps(compact_schema, indent=2)}
-
-CRITICAL:
-1. The 'response' field must contain your conversational output in the user's language.
-2. All other fields must contain the extracted information or "none".
-3. Do not include any text before or after the JSON object.
-4. Every response must be a single, complete JSON object.
-Do NOT output the schema definition."""
-        else:
-            system_prompt = f"""{formatted_system_prompt}
-
-Format your response using this JSON schema:
-{json.dumps(compact_schema, indent=2)}
-
-Output ONLY the JSON object containing the data. Do NOT output the schema definition."""
+        # The new prompt already has the JSON output format defined.
+        # Just return the formatted prompt as-is — no schema injection needed.
+        system_prompt = formatted_system_prompt
         
         schema_time = time.time() - schema_start
         logger.info(f"[TIMING] Schema generation took {schema_time:.3f}s")
@@ -317,7 +312,11 @@ Output ONLY the JSON object containing the data. Do NOT output the schema defini
                 "rate limit" in error_msg.lower() or 
                 "empty response" in error_msg.lower() or
                 "validation error" in error_msg.lower() or
-                "json" in error_msg.lower()  # Catch JSON parsing errors
+                "json" in error_msg.lower() or
+                "failed to generate" in error_msg.lower() or
+                "timeout" in error_msg.lower() or
+                "connection" in error_msg.lower() or
+                True  # Fallback on ANY primary model failure
             )
             
             if should_fallback:
@@ -363,13 +362,12 @@ Output ONLY the JSON object containing the data. Do NOT output the schema defini
         system_prompt = self.generate_system_prompt(formatted_system_prompt)
         
         # Get conversation history
-        if conversation_history is None:
-            conversation_history = self.get_conversation_history()
-        
-        # OPTIMIZE: Limit history to save tokens
-        # Reduced to 4 messages (2 exchanges) to mitigate rate limits
+        # Always use internal history for consistency
+        conversation_history = self.get_conversation_history()
+
+        # Keep last 6 messages (3 exchanges)
         if len(conversation_history) > 6:
-            conversation_history = conversation_history[-6:]  # Keep more context
+            conversation_history = conversation_history[-6:]
             logger.info(f"[OPTIMIZATION] Trimmed history to last 6 messages")
         
         # Prepare messages
@@ -405,10 +403,10 @@ Output ONLY the JSON object containing the data. Do NOT output the schema defini
         You must respond in JSON format with actual conversation data, NOT the schema definition.
 
         CORRECT example:
-        {"response": "Hi! Are you looking for 3 BHK or 4 BHK?", "conversation_stage": "bhk_preference", "preferred_bhk": "none"}
+        {"intent": "flow_progress", "assistant_text": "Hi! Are you looking for 3 BHK or 4 BHK?", "preferred_bhk": "none", "visit_date": "none", "visit_time": "none", "visit_confirmed": "no", "callback_scheduled": "no", "end_call": "no"}
 
         WRONG (do NOT do this):
-        {"type": "object", "properties": {"response": {"type": "string"}}}
+        {"type": "object", "properties": {"assistant_text": {"type": "string"}}}
 
         Respond NOW with actual data."""
             
@@ -476,9 +474,11 @@ Output ONLY the JSON object containing the data. Do NOT output the schema defini
             try:
                 parsed_response = self.ResponseModel.model_validate_json(response_content)
                 
+                # Get the spoken text — new schema uses assistant_text, old used response
+                spoken_text = getattr(parsed_response, 'assistant_text', None) or getattr(parsed_response, 'response', '')
+                
                 # SPECIAL CHECK: If response is empty but text looks like schema, force fallback
-                # The model might return the schema definition which validly parses (using defaults) but contains no data
-                if not parsed_response.response and ('"properties"' in response_content or "'properties'" in response_content):
+                if not spoken_text and ('"properties"' in response_content or "'properties'" in response_content):
                      logger.warning("[VALIDATION] Empty response with schema keywords - forcing fallback parsing")
                      raise ValueError("Possible schema reflection detected - empty response")
                      
@@ -486,22 +486,42 @@ Output ONLY the JSON object containing the data. Do NOT output the schema defini
                 logger.error(f"[ERROR] Response validation error: {validation_error}")
                 # Fallback parsing
                 parsed_response = self._parse_fallback_response(response_content)
+                spoken_text = getattr(parsed_response, 'assistant_text', None) or getattr(parsed_response, 'response', '')
             
-            # Add assistant response to history
-            self.add_to_history("assistant", parsed_response.response)
+            # Add assistant response to history (use clean spoken text)
+            self.add_to_history("assistant", spoken_text)
             
-            # Check for call end
-            should_end_call = any(
-                phrase in parsed_response.response.lower() 
-                for phrase in ["goodbye", "bye", "have a great day", "thank you for your time", "take care"]
-            )
+            # Check for call end — prefer explicit end_call field from new schema
+            should_end_call = False
             
-            # Also end call if callback is scheduled
-            if hasattr(parsed_response, 'callback_scheduled') and parsed_response.callback_scheduled and parsed_response.callback_scheduled.lower() == 'yes':
-                should_end_call = True
+            # 1. Check end_call field (new architecture)
+            if hasattr(parsed_response, 'end_call') and parsed_response.end_call:
+                should_end_call = str(parsed_response.end_call).lower() == 'yes'
+            
+            # 2. Check callback_scheduled field
+            if hasattr(parsed_response, 'callback_scheduled') and parsed_response.callback_scheduled:
+                if str(parsed_response.callback_scheduled).lower() == 'yes':
+                    should_end_call = True
+            
+            # 3. Fallback: detect farewell phrases in spoken text
+            if not should_end_call and spoken_text:
+                should_end_call = any(
+                    phrase in spoken_text.lower() 
+                    for phrase in [
+                        "have a wonderful day", "have a great day",
+                        "goodbye", "bye", "thank you for your time",
+                        "take care", "pleasure speaking"
+                    ]
+                )
+            
+            # Log intent if available
+            intent = getattr(parsed_response, 'intent', 'unknown')
+            logger.info(f"[LLM] Intent: {intent} | End call: {should_end_call}")
             
             return {
                 "response": parsed_response,
+                "spoken_text": spoken_text,
+                "intent": intent,
                 "should_end_call": should_end_call,
                 "raw_model_data": parsed_response.model_dump(),
                 "raw_response": response_content,
@@ -512,16 +532,29 @@ Output ONLY the JSON object containing the data. Do NOT output the schema defini
 
     def _get_default_response(self):
         """Return safe default response when all models fail"""
-        default_values = {'response': "I apologize, I'm experiencing technical difficulties. Could you please repeat that?"}
+        fallback_text = "I apologize, I'm experiencing technical difficulties. Could you please repeat that?"
         
+        default_values = {}
         if self.dynamic_fields:
             for field in self.dynamic_fields.keys():
                 default_values[field] = 'none'
         
+        # Set the spoken text field (new schema uses assistant_text)
+        if 'assistant_text' in (self.dynamic_fields or {}):
+            default_values['assistant_text'] = fallback_text
+            default_values['intent'] = 'flow_progress'
+            default_values['end_call'] = 'no'
+        else:
+            default_values['response'] = fallback_text
+        
         default_response = self.ResponseModel(**default_values)
+        
+        spoken_text = getattr(default_response, 'assistant_text', None) or getattr(default_response, 'response', fallback_text)
         
         return {
             "response": default_response,
+            "spoken_text": spoken_text,
+            "intent": "flow_progress",
             "should_end_call": False,
             "raw_model_data": default_response.model_dump(),
             "raw_response": "Error: All models failed",
@@ -532,6 +565,11 @@ Output ONLY the JSON object containing the data. Do NOT output the schema defini
 
     def _parse_fallback_response(self, response_content):
         """Attempt to parse response when validation fails or strict mode is off"""
+        # Determine which field holds the spoken text
+        uses_assistant_text = 'assistant_text' in (self.dynamic_fields or {})
+        text_field = 'assistant_text' if uses_assistant_text else 'response'
+        fallback_text = "Could you repeat that? I want to make sure I understood correctly."
+        
         try:
             # First, try to repair potential truncation (EOF errors)
             text = self._repair_truncated_json(response_content.strip())
@@ -550,57 +588,61 @@ Output ONLY the JSON object containing the data. Do NOT output the schema defini
                 logger.warning("[EXTRACTOR] Detected schema reflection in response")
                 props = raw_json.get("properties", {})
                 
-                # CRITICAL: Check if the 'response' field in props is actually a value or a schema definition
-                # If props['response'] is a dict with 'type': 'string', then it's a PURE SCHEMA HALLUCINATION
-                response_prop = props.get('response')
+                # Check if it's a PURE SCHEMA HALLUCINATION
+                response_prop = props.get(text_field) or props.get('response')
                 if isinstance(response_prop, dict) and 'type' in response_prop:
                     logger.warning("[EXTRACTOR] Detected PURE schema hallucination (no data). Using safe fallback.")
-                    # The model just returned the schema definition, not data matching the schema
-                    # We must NOT use this as data.
-                    # Force a safe fallback response
-                    default_values = {'response': "Could you repeat that? I want understood correctly."}
+                    default_values = {text_field: fallback_text}
                     if self.dynamic_fields:
                         for field in self.dynamic_fields.keys():
-                            default_values[field] = 'none'
+                            if field != text_field:
+                                default_values[field] = 'none'
                     return self.ResponseModel(**default_values)
 
-                # Otherwise, maybe the model trie to fill it? Use properties map as source
                 raw_json = props
+            
+            # Handle nested slots object from new schema
+            if 'slots' in raw_json and isinstance(raw_json['slots'], dict):
+                slots = raw_json['slots']
+                # Flatten slots into top-level fields
+                for slot_key in ['preferred_bhk', 'visit_date', 'visit_time', 'visit_confirmed', 'callback_scheduled']:
+                    if slot_key in slots and slot_key not in raw_json:
+                        val = slots[slot_key]
+                        raw_json[slot_key] = str(val) if val is not None else 'none'
                 
             default_values = {}
             if self.dynamic_fields:
                 for field in self.dynamic_fields.keys():
-                    # Ensure we extract a string, not a dict/list (unless expected)
                     val = raw_json.get(field, 'none')
                     if isinstance(val, (dict, list)):
                          val = 'none'
+                    if val is None:
+                        val = 'none'
                     default_values[field] = str(val)
             
-            # extract response safely
-            resp_val = raw_json.get('response', "Could you repeat that?")
+            # Extract spoken text safely
+            resp_val = raw_json.get(text_field) or raw_json.get('response') or raw_json.get('assistant_text') or fallback_text
             if isinstance(resp_val, (dict, list)):
-                resp_val = "I apologize, I didn't get that."
+                resp_val = fallback_text
                 
-            default_values['response'] = str(resp_val)
+            default_values[text_field] = str(resp_val)
             return self.ResponseModel(**default_values)
             
         except Exception as e:
             logger.warning(f"[EXTRACTOR] JSON parsing failed: {e}")
             
-            # Check if the content looks like a schema (contains "type": "object", "properties")
+            # Check if the content looks like a schema
             if ('"type"' in response_content and '"object"' in response_content and 
                 '"properties"' in response_content):
                 logger.error("[EXTRACTOR] Schema reflection detected in failed parse - using safe fallback")
-                # Don't speak the schema - use a safe default
-                default_values = {'response': "I didn't catch that. Could you repeat?"}
+                default_values = {text_field: "I didn't catch that. Could you repeat?"}
             else:
-                # Genuinely looks like a response, use it
-                default_values = {'response': response_content.strip()}
+                default_values = {text_field: response_content.strip()}
                 
-            # Set other fields to "none"
+            # Set other fields to defaults
             if self.dynamic_fields:
                 for field in self.dynamic_fields.keys():
-                    if field != 'response':
+                    if field != text_field:
                         default_values[field] = 'none'
 
             return self.ResponseModel(**default_values)

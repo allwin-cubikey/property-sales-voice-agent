@@ -81,7 +81,7 @@ class SarvamSTTService(BaseSTTService):
             # Connect to Sarvam WebSocket endpoint
             ws_url = config.SARVAM_STT_URL
             headers = {
-                "Authorization": f"Bearer {self.api_key}"
+                "api-subscription-key": self.api_key  # Sarvam uses this, not Bearer
             }
             
             logger.info(f"[STT] Connecting to Sarvam WebSocket: {ws_url}")
@@ -150,13 +150,11 @@ class SarvamSTTService(BaseSTTService):
     async def process_audio(self, audio_chunk: bytes) -> bool:
         """
         Process an audio chunk and send it to Sarvam STT service.
-        
+
         Args:
-            audio_chunk: Raw audio bytes (mulaw, 8kHz)
-            
-        Returns:
-            True if audio was successfully processed
+            audio_chunk: Raw PCM audio bytes (pcm_s16le, 16kHz) for Sarvam streaming
         """
+
         if not self._is_connected or not self.ws:
             logger.warning("[STT] Cannot process audio - not connected")
             return False

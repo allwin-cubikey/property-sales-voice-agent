@@ -5,6 +5,7 @@ Allows testing STT, LLM, and TTS services locally using microphone and speakers
 without telephony integration for the Property Enquiry Agent.
 """
 import asyncio
+import json
 import logging
 import pyaudio
 import audioop
@@ -17,10 +18,10 @@ from typing import Dict, Optional, List
 
 import config
 import prompts
+from prompts import STAGE_DEFINITIONS
 from services.stt_factory import STTServiceFactory
 from services.tts_factory import TTSServiceFactory
 from services.llm_service import GroqLLMService
-from utils.audio_utils import pcm_to_mulaw, mulaw_to_pcm
 
 logging.basicConfig(
     level=logging.INFO,
@@ -38,31 +39,47 @@ FORMAT = pyaudio.paInt16  # 16-bit PCM
 DEFAULT_USER_NAME = "John Doe"
 DEFAULT_USER_MESSAGE = "Looking for a 3 BHK apartment in Brigade Eternia"
 
-# Dynamic fields for Brigade Eternia site visit flow (matching main.py)
+# Dynamic fields for Brigade Eternia site visit flow (matching new architecture)
+# NOTE: conversation_stage removed — backend is sole authority
 BRIGADE_ETERNIA_DYNAMIC_FIELDS = {
-    "conversation_stage": {
+    "intent": {
         "type": "string",
-        "description": "Stage",
-        "default": "identity_check"
+        "description": "Intent classification",
+        "default": "flow_progress"
+    },
+    "assistant_text": {
+        "type": "string",
+        "description": "Spoken response text",
+        "default": ""
     },
     "preferred_bhk": {
         "type": "string",
-        "description": "BHK",
+        "description": "BHK preference",
         "default": "none"
     },
     "visit_date": {
         "type": "string",
-        "description": "Date",
+        "description": "Visit date",
         "default": "none"
     },
     "visit_time": {
         "type": "string",
-        "description": "Time",
+        "description": "Visit time",
         "default": "none"
     },
     "visit_confirmed": {
         "type": "string",
-        "description": "Confirmed",
+        "description": "Visit confirmed",
+        "default": "no"
+    },
+    "callback_scheduled": {
+        "type": "string",
+        "description": "Callback scheduled",
+        "default": "no"
+    },
+    "end_call": {
+        "type": "string",
+        "description": "End call flag",
         "default": "no"
     }
 }
@@ -75,7 +92,7 @@ STOP_WORDS = [
 ]
 
 # Timeout settings
-RECORD_TIMEOUT = 15  # seconds - reduced from 30 of silence before auto-shutdown
+RECORD_TIMEOUT = 25  # seconds - reduced from 30 of silence before auto-shutdown
 
 
 class LocalVoiceClient:
@@ -104,7 +121,23 @@ class LocalVoiceClient:
         self.call_ended = False
         self.is_user_speaking = False
         self.interruption_threshold = 800  # Tune: increase if false triggers, decrease if not triggering
-
+        self.completed_stages = []
+        self.current_stage = "identity_check"
+        self.is_processing = False  # Prevent concurrent LLM calls
+        
+        # Slots — source of truth for extracted data
+        self.slots = {
+            "preferred_bhk": None,
+            "visit_date": None,
+            "visit_time": None,
+            "visit_confirmed": "no",
+            "callback_scheduled": "no"
+        }
+        
+        # Callback time validation flag
+        self._awaiting_callback_time = False
+        # Site visit date/time validation flag
+        self._awaiting_visit_datetime = False
         
         self.input_stream = None
         self.output_stream = None
@@ -169,7 +202,18 @@ class LocalVoiceClient:
                 await self.handle_transcription(text)
             
             # Initialize STT
-            stt_init_success = await self.stt_service.initialize(api_key=stt_api_key, encoding="mulaw")
+            # Different STT providers have different init signatures
+            if config.STT_PROVIDER == 'deepgram':
+                stt_init_success = await self.stt_service.initialize(
+                    api_key=stt_api_key,
+                    encoding="linear16",
+                    sample_rate=SAMPLE_RATE
+                )
+            elif config.STT_PROVIDER == 'sarvam':
+                stt_init_success = await self.stt_service.initialize(api_key=stt_api_key)
+            else:
+                stt_init_success = await self.stt_service.initialize(api_key=stt_api_key)
+
             if not stt_init_success:
                 print(f"[ERROR] Failed to initialize {config.STT_PROVIDER} STT service")
                 return False
@@ -193,9 +237,12 @@ class LocalVoiceClient:
                 voice_id = config.CARTESIA_VOICE_ID
                 tts_kwargs = {'model_id': 'sonic-english', 'speed': 'normal'}
             else:
-                # Use config values for Sarvam
                 voice_id = config.SARVAM_VOICE_ID or 'rohan'
-                tts_kwargs = {'model': config.SARVAM_MODEL or 'bulbul:v3', 'language': 'en-IN', 'speed': 1.0}
+                tts_kwargs = {
+                    'model': config.SARVAM_MODEL or 'bulbul:v3',
+                    'language': config.SARVAM_LANGUAGE,
+                    'speed': config.SARVAM_SPEED
+                }
             
             self.tts_service = TTSServiceFactory.create(
                 provider=config.TTS_PROVIDER,
@@ -210,15 +257,10 @@ class LocalVoiceClient:
             print(f"[LLM] Creating Groq LLM service...")
             self.llm_service = GroqLLMService(api_key=config.GROQ_API_KEY, max_history=10)
             
-            # Get system prompt with actual user data
-            system_prompt = prompts.get_formatted_prompt(
-                user_name=self.user_name,
-                user_message=self.user_message
-            )
-            
+            # Pass raw prompt template — runtime context formatted per-turn via format_values
             await self.llm_service.initialize(
                 dynamic_fields=BRIGADE_ETERNIA_DYNAMIC_FIELDS,
-                system_prompt_template=system_prompt
+                system_prompt_template=prompts.BRIGADE_ETERNIA_SYSTEM_PROMPT
             )
             print(f"[LLM] OK - Groq LLM initialized")
             
@@ -292,35 +334,30 @@ class LocalVoiceClient:
                     # This prevents the AI's voice from being captured twice (direct + echo).
                     if not self.is_playing:
                         self.add_to_recording(pcm_data)
-                    
-                    import audioop
 
-                    # Convert PCM to mulaw for STT
-                    mulaw_data = pcm_to_mulaw(pcm_data, width=2)
+                    # Send raw PCM directly — Deepgram is configured for linear16/16kHz
+                    if config.STT_PROVIDER == 'deepgram':
+                        stt_audio = pcm_data  # linear16 matches mic format exactly
+                    else:
+                        stt_audio = pcm_data  # Sarvam also takes raw PCM
 
                     if not self.is_farewell:
                         if not self.is_playing:
-                            # Normal listening - always send to STT
                             if self.stt_service:
-                                await self.stt_service.process_audio(mulaw_data)
+                                await self.stt_service.process_audio(stt_audio)
                         else:
-                            # Agent speaking - check if user is interrupting
                             rms = audioop.rms(pcm_data, 2)
                             if rms > self.interruption_threshold:
                                 if not self.is_user_speaking:
                                     self.is_user_speaking = True
                                     logger.info(f"[INTERRUPT] User voice detected RMS:{rms} - stopping TTS immediately")
-                                    
-                                    # STOP TTS RIGHT NOW - don't wait for transcription
                                     self.is_playing = False
                                     if self.tts_service:
                                         await self.tts_service.stop()
-                                
                                 if self.stt_service:
-                                    await self.stt_service.process_audio(mulaw_data)
+                                    await self.stt_service.process_audio(stt_audio)
                             else:
                                 self.is_user_speaking = False
-                    
                     # Small sleep to prevent CPU overload
                     await asyncio.sleep(0.001)
                     
@@ -342,6 +379,11 @@ class LocalVoiceClient:
                 return
             
             if action == "finishAudio":
+                # Don't set is_playing=False here - audio still playing through speakers
+                # It gets set False after actual playback completes via asyncio.sleep
+                logger.info("[AUDIO] All chunks sent - waiting for playback to finish")
+                # Estimate remaining playback time based on last chunk size
+                await asyncio.sleep(0.3)  # Buffer for speaker playback drain
                 self.is_playing = False
                 logger.info("[AUDIO] Playback finished")
                 return
@@ -402,6 +444,247 @@ class LocalVoiceClient:
                 return True
         return False
     
+    def _extract_hour_from_text(self, text: str) -> int | None:
+        """
+        Extract hour (0-23) from spoken time text.
+        Returns None if no time found.
+        Examples: 'eleven pm' -> 23, '10 pm' -> 22, '5 o clock' -> 5
+        """
+        import re
+        
+        word_to_num = {
+            "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+            "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+            "eleven": 11, "twelve": 12, "midnight": 0, "noon": 12
+        }
+        
+        text = text.lower().strip()
+        
+        # Special cases
+        if "midnight" in text:
+            return 0
+        if "noon" in text:
+            return 12
+        
+        # Try numeric: "10 pm", "10:30 pm", "10am"
+        match = re.search(r'\b(\d{1,2})(?::\d{2})?\s*(am|pm)\b', text)
+        if match:
+            hour = int(match.group(1))
+            meridiem = match.group(2)
+            if meridiem == "pm" and hour != 12:
+                hour += 12
+            elif meridiem == "am" and hour == 12:
+                hour = 0
+            return hour
+        
+        # Try word form: "eleven pm", "five am"
+        for word, num in word_to_num.items():
+            if word in text:
+                if "pm" in text and num != 12:
+                    return num + 12
+                elif "am" in text and num == 12:
+                    return 0
+                elif "pm" in text or "am" in text:
+                    return num
+                # No meridiem — try to infer from context
+                # "tonight" + hour word -> assume PM
+                if any(w in text for w in ["tonight", "night", "evening"]):
+                    return num + 12 if num < 12 else num
+                if any(w in text for w in ["morning"]):
+                    return num
+        
+        return None
+    
+    def _validate_visit_datetime(self, text: str) -> str | None:
+        """
+        Validate a site visit date/time request.
+        Returns a rejection message string if invalid, or None if valid/unknown.
+        """
+        text_lower = text.lower().strip()
+        
+        # ── Past date detection (keywords + calendar dates) ──────────
+        if self._is_past_date(text_lower):
+            return "I'm sorry, I can't schedule a visit in the past. Could you suggest a date from today onwards?"
+        
+        # ── Time validation (8 AM - 9 PM) ───────────────────────────
+        hour = self._extract_hour_from_text(text_lower)
+        if hour is not None:
+            if hour < 8 or hour >= 21:
+                return "Site visits are available between 8 AM and 9 PM. What time works best for you?"
+        
+        return None  # Valid or unrecognised — let LLM handle
+
+    def _is_past_date(self, text: str) -> bool:
+        """
+        Check if text contains a date reference that is in the past.
+        Handles: 'February second', 'Feb 2nd', 'March 5', 'january tenth', etc.
+        """
+        import re
+        from datetime import datetime, date
+        
+        text_lower = text.lower().strip()
+        today = date.today()
+        
+        # Keyword-based past detection
+        past_keywords = ["yesterday", "day before", "last week", "last month",
+                         "last year", "two days ago", "three days ago"]
+        if any(p in text_lower for p in past_keywords):
+            return True
+        
+        # Month name mapping
+        months = {
+            "january": 1, "jan": 1, "february": 2, "feb": 2,
+            "march": 3, "mar": 3, "april": 4, "apr": 4,
+            "may": 5, "june": 6, "jun": 6, "july": 7, "jul": 7,
+            "august": 8, "aug": 8, "september": 9, "sep": 9, "sept": 9,
+            "october": 10, "oct": 10, "november": 11, "nov": 11,
+            "december": 12, "dec": 12
+        }
+        
+        # Ordinal word mapping
+        ordinals = {
+            "first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5,
+            "sixth": 6, "seventh": 7, "eighth": 8, "ninth": 9, "tenth": 10,
+            "eleventh": 11, "twelfth": 12, "thirteenth": 13, "fourteenth": 14,
+            "fifteenth": 15, "sixteenth": 16, "seventeenth": 17, "eighteenth": 18,
+            "nineteenth": 19, "twentieth": 20, "twenty first": 21, "twenty second": 22,
+            "twenty third": 23, "twenty fourth": 24, "twenty fifth": 25,
+            "twenty sixth": 26, "twenty seventh": 27, "twenty eighth": 28,
+            "twenty ninth": 29, "thirtieth": 30, "thirty first": 31
+        }
+        
+        # Try to find a month
+        found_month = None
+        for month_name, month_num in months.items():
+            if month_name in text_lower:
+                found_month = month_num
+                break
+        
+        if found_month is None:
+            return False
+        
+        # Try to find a day — ordinal words first, then numeric
+        found_day = None
+        for ord_word, day_num in ordinals.items():
+            if ord_word in text_lower:
+                found_day = day_num
+                break
+        
+        if found_day is None:
+            # Try numeric: "Feb 2", "February 2nd", "March 15th"
+            match = re.search(r'\b(\d{1,2})(?:st|nd|rd|th)?\b', text_lower)
+            if match:
+                found_day = int(match.group(1))
+        
+        if found_day is None or found_day < 1 or found_day > 31:
+            return False
+        
+        # Build the date (assume current year)
+        try:
+            target_date = date(today.year, found_month, found_day)
+            return target_date < today
+        except ValueError:
+            return False  # Invalid date like Feb 30 — let LLM handle
+
+    def _clean_for_tts(self, text: str) -> str:
+        """Remove special characters that TTS might try to speak."""
+        import re
+        # Remove ?, !, *, #, and other non-speech characters
+        cleaned = re.sub(r'[?!*#@&^~`|<>{}\[\]\\]', '', text)
+        # Collapse double spaces
+        cleaned = re.sub(r'\s{2,}', ' ', cleaned)
+        return cleaned.strip()
+
+    def _check_farewell(self, text: str) -> bool:
+        """Return True if user is clearly saying goodbye."""
+        farewell_phrases = [
+            "bye", "goodbye", "good bye", "see you", "see ya", "take care",
+            "thanks bye", "thank you bye", "that's all", "thats all",
+            "i'm done", "im done", "end call", "hang up", "no more",
+            "nothing else", "all good bye", "ok bye", "okay bye"
+        ]
+        text_lower = text.lower().strip()
+        return any(p in text_lower for p in farewell_phrases)
+
+    def _validate_bhk(self, text: str) -> str | None:
+        """
+        Validate BHK preference input.
+        Returns rejection message if invalid, None if valid.
+        """
+        text_lower = text.lower().strip()
+        valid_3bhk = ["3 bhk", "3bhk", "three bhk", "three bedroom", "three b h k", "3 b h k"]
+        valid_4bhk = ["4 bhk", "4bhk", "four bhk", "four bedroom", "four b h k", "4 b h k"]
+        invalid_bhk = ["1 bhk", "1bhk", "one bhk", "2 bhk", "2bhk", "two bhk",
+                       "5 bhk", "5bhk", "five bhk", "studio", "penthouse"]
+
+        if any(p in text_lower for p in invalid_bhk):
+            return "We only have 3 B H K and 4 B H K options at Brigade Eternia. Which would you prefer?"
+
+        if any(p in text_lower for p in valid_3bhk + valid_4bhk):
+            return None  # Valid
+
+        # Vague answers — let LLM handle (don't reject, don't advance)
+        return None
+
+    def _validate_urgency_timeline(self, text: str) -> str | None:
+        """
+        Reject nonsensical urgency timelines (past years, impossible dates).
+        Returns rejection message if invalid, None if valid.
+        """
+        import re
+        text_lower = text.lower().strip()
+
+        # Past absolute years (e.g. "1990", "2020", "2019")
+        year_match = re.search(r'\b(19\d{2}|202[0-4])\b', text_lower)
+        if year_match:
+            return f"I think that date has already passed! Are you planning to buy in the near future, like this year or next?"
+
+        # Past relative phrases
+        past_phrases = ["last year", "last month", "already bought", "already purchased",
+                        "i already have", "i bought", "years ago", "decade ago"]
+        if any(p in text_lower for p in past_phrases):
+            return "It sounds like that's already in the past! When are you planning to make your next purchase?"
+
+        return None
+
+    def _check_identity_confirmation(self, text: str) -> bool:
+        """
+        Return True only if user gives a clear identity confirmation.
+        Rejects weak sounds like 'uh', 'hmm', 'er'.
+        """
+        text_lower = text.lower().strip()
+        # Weak/ambiguous sounds — NOT a confirmation
+        weak_sounds = ["uh", "um", "hmm", "hm", "er", "ah", "oh"]
+        if text_lower in weak_sounds or (len(text_lower) <= 3 and text_lower not in ["yes", "yep", "yup", "ji", "ha"]):
+            return False
+        # Strong confirmation words
+        strong_confirm = ["yes", "yeah", "yep", "yup", "speaking", "this is", "i am",
+                          "iam", "correct", "right", "that's me", "thats me", "ji", "haan",
+                          "sir", "of course", "absolutely"]
+        return any(p in text_lower for p in strong_confirm)
+
+    def _check_out_of_scope(self, text: str) -> str | None:
+        """
+        Detect clearly out-of-scope topics and return a fixed deflection.
+        Returns deflection message if out-of-scope, None if normal.
+        """
+        text_lower = text.lower().strip()
+        out_of_scope_topics = [
+            # Politics
+            "modi", "rahul gandhi", "bjp", "congress", "election", "vote", "politics",
+            # Sports
+            "cricket", "ipl", "football", "match", "score", "world cup", "virat", "dhoni",
+            # Entertainment
+            "movie", "film", "actor", "actress", "bollywood", "netflix", "web series",
+            # Weather
+            "weather", "rain", "temperature", "forecast", "climate",
+            # Other
+            "stock market", "share price", "crypto", "bitcoin",
+        ]
+        if any(topic in text_lower for topic in out_of_scope_topics):
+            return "I'm focused on Brigade Eternia today! Is there anything about the project I can help you with?"
+        return None
+
     def start_recording(self):
         """Initialize recording session."""
         if not self.recording_enabled:
@@ -473,12 +756,24 @@ class LocalVoiceClient:
         except Exception as e:
             logger.error(f"[ERROR] Error during graceful shutdown: {e}")
     
-    async def handle_transcription(self, text: str):
+    async def handle_transcription(self, text):
         """Handle transcribed text from STT."""
+
+        # Guard: STT may pass a dict instead of string
+        if isinstance(text, dict):
+            text = text.get("text", text.get("transcript", text.get("message", "")))
+        text = str(text) if text else ""
 
         if self.call_ended:
             logger.info("[LOCAL] Ignoring - call already ended")
             return
+
+        # Prevent concurrent LLM calls
+        if self.is_processing:
+            logger.info("[LOCAL] Already processing, ignoring duplicate transcription")
+            return
+
+        self.is_processing = True
 
         try:
             # Handle force stop
@@ -507,7 +802,7 @@ class LocalVoiceClient:
                     return
             # Update last speech time
             self.last_user_speech_time = datetime.now().timestamp()
-            
+
             print(f"\\n[TRANSCRIBED] User: {text}")
             
             # Check for stop words
@@ -515,37 +810,244 @@ class LocalVoiceClient:
                 print(f"[STOP WORD DETECTED] Ending session...")
                 await self.graceful_shutdown()
                 return
-            
-            # Add to conversation history
-            self.conversation_history.append({
-                "role": "user",
-                "content": text
-            })
-            
+
+            # ─────────────────────────────────────────────────────────
+            # PYTHON-LEVEL VALIDATION HOOKS (bypass LLM entirely)
+            # ─────────────────────────────────────────────────────────
+
+            async def _speak_and_return(msg: str, intent_label: str = "validation") -> None:
+                print(f"[RESPONSE] AI ({intent_label}): {msg}")
+                async def _cb(chunk, action): await self.play_audio(chunk, action)
+                await self.tts_service.synthesize(self._clean_for_tts(msg), _cb)
+                print("[LISTENING] Listening for your response...\\n")
+
+            # 1. OUT-OF-SCOPE GUARD (runs on every turn)
+            oos_msg = self._check_out_of_scope(text)
+            if oos_msg:
+                logger.info(f"[OOS] Deflecting out-of-scope: '{text}'")
+                await _speak_and_return(oos_msg, "out_of_scope")
+                return
+
+            # 2. FAREWELL DETECTION (runs on every turn)
+            if self._check_farewell(text):
+                farewell_msg = f"It was a pleasure speaking with you. Have a great day, {self.greeting_name}!"
+                logger.info(f"[FAREWELL] User said goodbye: '{text}'")
+                print(f"[RESPONSE] AI (farewell): {farewell_msg}")
+                async def _fare_cb(chunk, action): await self.play_audio(chunk, action)
+                await self.tts_service.synthesize(farewell_msg, _fare_cb)
+                await self.graceful_shutdown()
+                return
+
+            # 3. IDENTITY CHECK — reject weak confirmations
+            if self.current_stage == "identity_check":
+                if not self._check_identity_confirmation(text):
+                    # Weak sound — ask again without calling LLM
+                    logger.info(f"[IDENTITY] Weak confirmation ignored: '{text}'")
+                    clarify = f"Sorry, I didn't catch that. Am I speaking with {self.greeting_name}?"
+                    await _speak_and_return(clarify, "identity_check")
+                    return
+
+            # 4. BHK VALIDATION
+            if self.current_stage == "bhk_preference":
+                bhk_msg = self._validate_bhk(text)
+                if bhk_msg:
+                    logger.info(f"[BHK] Invalid BHK input: '{text}'")
+                    await _speak_and_return(bhk_msg, "bhk_preference")
+                    return
+
+            # 5. URGENCY TIMELINE VALIDATION
+            if self.current_stage == "urgency_assessment":
+                urgency_msg = self._validate_urgency_timeline(text)
+                if urgency_msg:
+                    logger.info(f"[URGENCY] Invalid timeline: '{text}'")
+                    await _speak_and_return(urgency_msg, "urgency_assessment")
+                    return
+
             # Get LLM response
             print("[THINKING] Processing...")
+
+            # STEP 1: Update stages based on user input (backend state machine)
+            text_lower = text.lower()
             
-            # LLM service manages conversation history internally
-            response = await self.llm_service.generate_response(user_input=text)
+            import re
+            def has_word(text, words):
+                """Check if any whole word from list exists in text."""
+                pattern = r'\b(' + '|'.join(re.escape(w) for w in words) + r')\b'
+                return bool(re.search(pattern, text))
+
+            if self.current_stage == "identity_check":
+                positive = ["yes", "speaking", "this is", "yeah", "yep", 
+                            "i am", "iam", "sir", "ji", "haan", "correct",
+                            "right", "that's me", "thats me"]
+                if has_word(text_lower, positive):
+                    if "identity_check" not in self.completed_stages:
+                        self.completed_stages.append("identity_check")
+                    self.current_stage = "timing_check"
+
+            elif self.current_stage == "timing_check":
+                positive = ["yes", "yeah", "sure", "go ahead", "yep", "okay", "ok", "fine", 
+                            "absolutely", "sir", "ji", "haan", "please", "of course", 
+                            "why not", "definitely", "good time", "go on"]
+                negative = ["no", "not now", "busy", "later", "call back", "bad time"]
+                
+                if has_word(text_lower, positive) and not has_word(text_lower, negative):
+                    if "timing_check" not in self.completed_stages:
+                        self.completed_stages.append("timing_check")
+                    self.current_stage = "bhk_preference"
+
+            elif self.current_stage == "bhk_preference":
+                bhk_words = ["3 bhk", "3bhk", "three bhk", "three bedroom",
+                             "three", "3 bed", "4 bhk", "4bhk", "four bhk", 
+                             "four bedroom", "four", "4 bed",
+                             "first one", "first option", "second one", "second option",
+                             "third one", "third option", "the first", "the second", "the third"]
+                if has_word(text_lower, bhk_words):
+                    if "bhk_preference" not in self.completed_stages:
+                        self.completed_stages.append("bhk_preference")
+                    self.current_stage = "urgency_assessment"
+
+            elif self.current_stage == "urgency_assessment":
+                # Any answer to urgency moves forward
+                if len(text_lower.strip()) > 2:  # Any real response
+                    if "urgency_assessment" not in self.completed_stages:
+                        self.completed_stages.append("urgency_assessment")
+                    self.current_stage = "site_visit_scheduling"
+
+            elif self.current_stage == "site_visit_scheduling":
+                time_words = ["tomorrow", "today", "weekend", "monday", "tuesday",
+                              "wednesday", "thursday", "friday", "saturday", "sunday",
+                              "morning", "evening", "afternoon", "night", "next week",
+                              "next month", "this week", "this month", "next year"]
+                if has_word(text_lower, time_words):
+                    self.current_stage = "post_visit_confirmed"
+
+            logger.info(f"[STAGE] Current: {self.current_stage} | Done: {self.completed_stages}")
+
+            # STEP 2: Build clean runtime context (NO stage note pollution in user text)
+            stage_info = STAGE_DEFINITIONS.get(self.current_stage, STAGE_DEFINITIONS["identity_check"])
             
-            ai_text = response["response"].response
-            
-            # Validate response is not empty
+            # ─────────────────────────────────────────────────────────
+            # BUSINESS HOURS ENFORCEMENT (Python-level, bypasses LLM)
+            # ─────────────────────────────────────────────────────────
+            if getattr(self, "_awaiting_callback_time", False):
+                # Reject past dates (calendar dates + keywords like "yesterday")
+                if self._is_past_date(text_lower):
+                    rejection = "I can only schedule callbacks for a future date and time between 8 AM and 9 PM. When works best?"
+                    logger.info(f"[CALLBACK] Rejected past date: '{text}'")
+                    await _speak_and_return(rejection, "reschedule")
+                    return
+                # Try to extract an hour from the user's text
+                hour = self._extract_hour_from_text(text_lower)
+                if hour is not None:
+                    if hour < 8 or hour >= 21:  # Outside 8 AM - 9 PM
+                        rejection = "I can only schedule callbacks between 8 AM and 9 PM. What time works best for you?"
+                        logger.info(f"[CALLBACK] Rejected time (hour={hour}): '{text}'")
+                        await _speak_and_return(rejection, "reschedule")
+                        return
+                    else:
+                        # Valid time — clear flag, let LLM confirm and end call
+                        self._awaiting_callback_time = False
+                else:
+                    # No hour detected — re-ask instead of falling through to LLM
+                    re_ask = "Could you please tell me a specific time for the callback? For example, tomorrow at 3 PM."
+                    logger.info(f"[CALLBACK] No valid time detected, re-asking: '{text}'")
+                    await _speak_and_return(re_ask, "reschedule")
+                    return
+
+            # ─────────────────────────────────────────────────────────
+            # SITE VISIT DATE/TIME ENFORCEMENT (Python-level, bypasses LLM)
+            # ─────────────────────────────────────────────────────────
+            if getattr(self, "_awaiting_visit_datetime", False):
+                rejection = self._validate_visit_datetime(text_lower)
+                if rejection:
+                    logger.info(f"[VISIT] Rejected date/time: '{text}'")
+                    print(f"[RESPONSE] AI (flow_progress): {rejection}")
+                    async def visit_audio_cb(chunk, action): await self.play_audio(chunk, action)
+                    await self.tts_service.synthesize(rejection, visit_audio_cb)
+                    print("[LISTENING] Listening for your response...\\n")
+                    return
+                else:
+                    # Valid — clear flag, let LLM confirm
+                    self._awaiting_visit_datetime = False
+
+            # Add user message to conversation history
+            self.conversation_history.append({"role": "user", "content": text})
+
+            # Build format values for prompt template
+            format_values = {
+                "user_name": self.greeting_name,
+                "user_message": text,
+                "current_stage": self.current_stage,
+                "stage_goal": stage_info["goal"],
+                "slots": json.dumps(self.slots),
+                "current_date": datetime.now().strftime("%B %d, %Y")
+            }
+
+            # STEP 3: Call LLM with clean user text + conversation context
+            # Pass last 10 messages so LLM has memory of the conversation
+            recent_history = self.conversation_history[-10:] if self.conversation_history else []
+            response = await self.llm_service.generate_response(
+                user_input=text,
+                conversation_history=recent_history,
+                format_values=format_values
+            )
+
+            # STEP 4: Extract response using new schema
+            ai_text = response.get("spoken_text", "")
+
             if not ai_text or not ai_text.strip():
                 logger.error("[ERROR] LLM returned empty response")
                 ai_text = "I'm sorry, I didn't quite get that. Could you please repeat?"
+
+            intent = response.get("intent", "unknown")
+            print(f"[RESPONSE] AI ({intent}): {ai_text}")
+
+            # Add AI response to conversation history
+            self.conversation_history.append({"role": "assistant", "content": ai_text})
             
-            print(f"[RESPONSE] AI: {ai_text}")
-            
-            # Update collected data
+            # Set flag if LLM is asking for callback time (NOT site visit time)
+            callback_ask_phrases = ["when would be a good time", "what time works", "when can i call", "when should i call"]
+            visit_phrases = ["site visit", "visit the site", "schedule a visit", "visit us", "come visit"]
+            is_asking_callback_time = (
+                intent == "reschedule"
+                and any(p in ai_text.lower() for p in callback_ask_phrases)
+                and not any(p in ai_text.lower() for p in visit_phrases)
+            )
+            if is_asking_callback_time:
+                self._awaiting_callback_time = True
+                logger.info("[CALLBACK] Now awaiting callback time from user")
+            elif intent != "reschedule":
+                # Clear the flag if we've moved away from reschedule flow
+                self._awaiting_callback_time = False
+
+            # Set flag if LLM is asking for site visit date/time
+            visit_ask_phrases = ["what day", "what time works for your visit", "when would you like to visit",
+                                  "when can you visit", "schedule a visit", "day and time works"]
+            is_asking_visit_time = (
+                self.current_stage == "site_visit_scheduling"
+                and any(p in ai_text.lower() for p in visit_ask_phrases)
+            )
+            if is_asking_visit_time:
+                self._awaiting_visit_datetime = True
+                logger.info("[VISIT] Now awaiting visit date/time from user")
+            elif self.current_stage != "site_visit_scheduling":
+                self._awaiting_visit_datetime = False
+
+            # Reset silence timer after LLM responds
+            self.last_user_speech_time = datetime.now().timestamp()
+
+            # STEP 5: Update slots from LLM output
             if "raw_model_data" in response:
-                self.collected_data = response["raw_model_data"]
-            
-            # Add to conversation history
-            self.conversation_history.append({
-                "role": "assistant",
-                "content": ai_text
-            })
+                raw_data = response["raw_model_data"]
+                self.collected_data = raw_data
+                
+                # Update slots with non-null values from LLM
+                for slot_key in self.slots:
+                    val = raw_data.get(slot_key)
+                    if val and val != "none" and val != "null":
+                        self.slots[slot_key] = val
+                
+                logger.info(f"[SLOTS] {self.slots}")
             
             # Synthesize response
             print("[SPEAKING] Playing audio...")
@@ -560,7 +1062,7 @@ class LocalVoiceClient:
                 self.call_ended = True
                 logger.info("[LOCAL] Farewell detected - blocking STT")
 
-            await self.tts_service.synthesize(ai_text, audio_callback)
+            await self.tts_service.synthesize(self._clean_for_tts(ai_text), audio_callback)
 
             # Check if should end call AFTER TTS finishes
             if response.get("should_end_call") or self.call_ended:
@@ -573,6 +1075,8 @@ class LocalVoiceClient:
         except Exception as e:
             logger.error(f"[ERROR] Error handling transcription: {e}", exc_info=True)
             print(f"\\nERROR: {e}\\n")
+        finally:
+            self.is_processing = False  # Always release lock
     
     async def start_session(self):
         """Start the local testing session."""
@@ -592,10 +1096,17 @@ class LocalVoiceClient:
             
             # Use centralized greeting from config
             welcome_greeting = config.GREETING_TEMPLATE.format(name=self.greeting_name)
-            
+
+            # Don't manually track - LLM service handles history internally
+
+            # Add to LLM's internal history so it knows Stage 1 was already said
+            self.llm_service.add_to_history("assistant", welcome_greeting)
+            self.current_stage = "identity_check"
+            logger.info(f"[STAGE] Welcome greeting added to LLM history: {welcome_greeting}")
+
             async def welcome_callback(audio_chunk: bytes, action: str):
                 await self.play_audio(audio_chunk, action)
-            
+
             await self.tts_service.synthesize(welcome_greeting, welcome_callback)
             
             # Initialize timeout tracking
@@ -619,9 +1130,27 @@ class LocalVoiceClient:
         try:
             print("\\n[CLEANUP] Closing services...")
             
+            # 1. Set flags first - stop all processing
             self.is_recording = False
+            self.call_ended = True
+            self.is_processing = False
             
-            # Close audio streams
+            # 2. Close STT FIRST - stops incoming transcriptions
+            if self.stt_service:
+                await self.stt_service.close()
+            
+            # 3. Small wait for any in-flight callbacks to complete
+            await asyncio.sleep(0.2)
+            
+            # 4. Close TTS
+            if self.tts_service:
+                await self.tts_service.close()
+            
+            # 5. Close LLM
+            if self.llm_service:
+                await self.llm_service.close()
+            
+            # 6. Close audio hardware LAST
             if self.input_stream:
                 self.input_stream.stop_stream()
                 self.input_stream.close()
@@ -631,16 +1160,6 @@ class LocalVoiceClient:
                 self.output_stream.close()
             
             self.audio.terminate()
-            
-            # Close services
-            if self.stt_service:
-                await self.stt_service.close()
-            
-            if self.tts_service:
-                await self.tts_service.close()
-            
-            if self.llm_service:
-                await self.llm_service.close()
             
             # Print session summary
             if self.session_start:
