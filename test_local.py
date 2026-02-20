@@ -189,7 +189,7 @@ class LocalVoiceClient:
             os.makedirs(self.recordings_dir, exist_ok=True)
             logger.info(f"[RECORDING] Enabled - saving to {self.recordings_dir}/")
         
-        # Dedicated audio playback thread — PyAudio must be written from a single
+        # dedicated audio playback thread — PyAudio must be written from a single
         # tight loop thread to avoid buffer underruns (static/crackle).
         self._pcm_queue: queue.Queue = queue.Queue(maxsize=500)
         self._audio_thread: threading.Thread = None
@@ -534,9 +534,9 @@ class LocalVoiceClient:
                 
                 # Enqueue for audio thread — instant, non-blocking, event loop stays free
                 try:
-                    self._pcm_queue.put_nowait(pcm_data)
+                    self._pcm_queue.put(pcm_data, timeout=5.0)
                 except queue.Full:
-                    logger.warning("[AUDIO] PCM queue full — dropping chunk to avoid lag")
+                    logger.error("[AUDIO] PCM queue stuck for 5s — audio dropped")
                     
         except Exception as e:
             error_msg = str(e)
@@ -648,9 +648,31 @@ class LocalVoiceClient:
         
         return None
     
+    def _validate_callback_time(self, text: str) -> str | None:
+        """
+        Validate callback time (8 AM - 9 PM).
+        Returns rejection message if invalid, None if valid.
+        """
+        hour = self._extract_hour_from_text(text)
+        if hour is not None:
+             if hour < 8 or hour >= 21:
+                 return "I can only schedule callbacks between 8 AM and 9 PM. What time works best for you?"
+        return None
+
+    def _validate_visit_time(self, text: str) -> str | None:
+        """
+        Validate site visit time (9 AM - 6 PM).
+        Returns rejection message if invalid, None if valid.
+        """
+        hour = self._extract_hour_from_text(text)
+        if hour is not None:
+            if hour < 9 or hour >= 18:
+                return "Site visits are typically between 9 AM and 6 PM. What time in that window works for you?"
+        return None
+
     def _validate_visit_datetime(self, text: str) -> str | None:
         """
-        Validate a site visit date/time request.
+        Validate a site visit date/time request (Wrapper).
         Returns a rejection message string if invalid, or None if valid/unknown.
         """
         text_lower = text.lower().strip()
@@ -659,13 +681,9 @@ class LocalVoiceClient:
         if self._is_past_date(text_lower):
             return "I'm sorry, I can't schedule a visit in the past. Could you suggest a date from today onwards?"
         
-        # ── Time validation (8 AM - 9 PM) ───────────────────────────
-        hour = self._extract_hour_from_text(text_lower)
-        if hour is not None:
-            if hour < 8 or hour >= 21:
-                return "Site visits are available between 8 AM and 9 PM. What time works best for you?"
-        
-        return None  # Valid or unrecognised — let LLM handle
+        # ── Time validation (9 AM - 6 PM) ───────────────────────────
+        # Fix 1: Use specific visit validator, NOT callback logic
+        return self._validate_visit_time(text_lower)
 
     def _is_past_date(self, text: str) -> bool:
         """
@@ -1098,30 +1116,34 @@ class LocalVoiceClient:
                     logger.info(f"[CALLBACK] Rejected past date: '{text}'")
                     await _speak_and_return(rejection, "reschedule")
                     return
-                # Try to extract an hour from the user's text
+            # BUSINESS HOURS ENFORCEMENT (Python-level, bypasses LLM)
+            if getattr(self, "_awaiting_callback_time", False):
+                # ... (validation logic) ...
+                # Use split validator (Fix 1)
+                rejection = self._validate_callback_time(text_lower)
+                if rejection:
+                     logger.info(f"[CALLBACK] Rejected time: '{text}'")
+                     await _speak_and_return(rejection, "reschedule")
+                     return
+
                 hour = self._extract_hour_from_text(text_lower)
                 if hour is not None:
-                    if hour < 8 or hour >= 21:  # Outside 8 AM - 9 PM
-                        rejection = "I can only schedule callbacks between 8 AM and 9 PM. What time works best for you?"
-                        logger.info(f"[CALLBACK] Rejected time (hour={hour}): '{text}'")
-                        await _speak_and_return(rejection, "reschedule")
-                        return
-                    else:
-                        # Valid time — confirm directly without going to LLM
-                        # (If LLM handles this, it sometimes re-validates and re-asks incorrectly)
-                        self._awaiting_callback_time = False
-                        self.slots["callback_scheduled"] = "yes"
-                        
-                        # Format extracted hour for speech
-                        formatted_time = f"{hour - 12} PM" if hour > 12 else (f"{hour} PM" if hour == 12 else f"{hour} AM")
-                        if hour == 0: formatted_time = "12 AM"
-                        if hour == 12: formatted_time = "12 PM"
-                        
-                        logger.info(f"[CALLBACK] Valid time accepted (hour={hour}): '{text}' — confirming directly")
-                        confirmation = f"Perfect, I'll schedule a callback for you at {formatted_time}. You'll receive a confirmation on WhatsApp shortly. It was a pleasure speaking with you — have a great day, {self.greeting_name}!"
-                        await _speak_and_return(confirmation, "reschedule")
-                        await self.graceful_shutdown()
-                        return
+                    # Valid time — confirm directly without going to LLM
+                    self._awaiting_callback_time = False
+                    
+                    # Fix 4: Update slot immediately
+                    self.slots["callback_scheduled"] = "yes"
+                    
+                    # Format extracted hour for speech
+                    formatted_time = f"{hour - 12} PM" if hour > 12 else (f"{hour} PM" if hour == 12 else f"{hour} AM")
+                    if hour == 0: formatted_time = "12 AM"
+                    if hour == 12: formatted_time = "12 PM"
+                    
+                    logger.info(f"[CALLBACK] Valid time accepted (hour={hour}): '{text}' — confirming directly")
+                    confirmation = f"Perfect, I'll schedule a callback for you at {formatted_time}. You'll receive a confirmation on WhatsApp shortly. It was a pleasure speaking with you — have a great day, {self.greeting_name}!"
+                    await _speak_and_return(confirmation, "reschedule")
+                    await self.graceful_shutdown()
+                    return
                 else:
                     # No hour detected — re-ask instead of falling through to LLM
                     re_ask = "Could you please tell me a specific time for the callback? For example, tomorrow at 3 PM."
@@ -1291,7 +1313,18 @@ class LocalVoiceClient:
             # Retrieve meta parsed from the full JSON (intent, slots, end_call, etc.)
             response = self.llm_service.last_response_meta
             ai_text  = full_ai_text.strip()
-
+            
+            # Fix 3: Fallback slot extraction for visit_date
+            if self.current_stage == "site_visit_scheduling" and not self.slots.get("visit_date"):
+                 # Simple keyword check for common dates
+                 text_lower = text.lower()
+                 date_keywords = ["tomorrow", "day after", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday", "today"]
+                 for kw in date_keywords:
+                      if kw in text_lower:
+                           self.slots["visit_date"] = kw
+                           logger.info(f"[SLOTS] Fallback extracted visit_date: {kw}")
+                           break
+            
             # STEP 4b: Strip any residual emotion tag from assembled text (safety net)
             ai_text, _residual_emotion = extract_emotion(ai_text)
             if not final_emotion:

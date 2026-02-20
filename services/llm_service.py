@@ -716,138 +716,198 @@ class GroqLLMService:
         self.last_response_meta = self._get_default_response()
         stream_start = time.time()
         
-        try:
-            # 1. Prepare Prompt
-            formatted_prompt = self.format_system_prompt(**format_values)
-            system_prompt = self.generate_system_prompt(formatted_prompt)
-
-            history = list(conversation_history or self.get_conversation_history())
-            if len(history) > 6:
-                history = history[-6:]
-
-            messages = [
-                {"role": "system", "content": system_prompt},
-                *history,
-                {"role": "user", "content": user_input},
-            ]
-            
-            # 2. Determine Model
-            default_model = "llama-4-maverick"
-            model = os.getenv("GROQ_MODEL", getattr(config, "GROQ_PRIMARY_MODEL", default_model))
-            
-            # 3. Prepare API Call
-            api_payload = {
-                "model": model,
-                "messages": messages,
-                "temperature": config.LLM_TEMPERATURE,
-                "top_p": config.LLM_TOP_P,
-                "max_tokens": config.MAX_LLM_TOKENS,
-                "stream": True
-            }
-            
-            # Use strict JSON for new models
-            if "llama-4" in model.lower() or "70b" in model:
-                api_payload["response_format"] = {"type": "json_object"}
-            
-            # 4. Execute Stream (Accumulate)
-            full_accum = ""
-            api_start = time.time()
-            
-            async with self.session.post(
-                config.GROQ_URL,
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json"
-                },
-                json=api_payload
-            ) as response:
-            
-                if response.status != 200:
-                    text_err = await response.text()
-                    logger.error(f"[GROQ] Stream error {response.status}: {text_err}")
-                    yield "I apologize, I'm having a connection issue.", True, None
-                    return
-
-                # Read lines for SSE
-                async for line in response.content:
-                    line = line.strip()
-                    if not line or line == b'data: [DONE]':
-                        continue
-                        
-                    if line.startswith(b'data: '):
-                        chunk_str = line[6:].decode('utf-8')
-                        try:
-                            chunk_json = json.loads(chunk_str)
-                            delta = chunk_json.get("choices", [{}])[0].get("delta", {}).get("content", "")
-                            if delta:
-                                full_accum += delta
-                        except Exception:
-                            pass
-            
-            # 5. Process Full Response
-            api_time = time.time() - api_start
-            
-            # Parsing logic (inline to avoid dependency issues)
-            final_text = ""
+        # Retry logic for 400 errors / empty responses
+        max_retries = 2
+        retry_count = 0
+        
+        while retry_count <= max_retries:
             try:
-                # Basic json repair if needed
-                json_text = full_accum.strip()
-                # If we have an open quote at the end, close it
-                if json_text.count('"') % 2 != 0: json_text += '"'
-                if json_text.count("{") > json_text.count("}"): json_text += "}"
-                
-                data = json.loads(json_text)
-                final_text = data.get("assistant_text") or data.get("response") or ""
-            except Exception:
-                # Regex fallback
-                m = re.search(r'"assistant_text"\s*:\s*"((?:[^"\\]|\\.)*)"', full_accum, re.DOTALL)
-                if m:
-                     try:
-                        final_text = m.group(1).encode('utf-8').decode('unicode_escape')
-                     except:
-                        final_text = m.group(1)
-            
-            if not final_text:
-                 final_text = full_accum # Fallback
-            
-            # Extract Emotion
-            emotion = None
-            emotion_match = re.search(r"\[EMOTION:\s*([a-z]+)\]\s*$", final_text, re.IGNORECASE | re.MULTILINE)
-            if emotion_match:
-                emotion = emotion_match.group(1).lower()
-                final_text = final_text[:emotion_match.start()].strip()
-            
-            logger.info(f"[GROQ] Full stream received in {api_time:.2f}s ({len(full_accum)} chars) | intent=unknown | emotion={emotion}")
-            
-            yield final_text, True, emotion
-            
-            # 6. Parse Meta
-            try:
-                # Reuse existing parsing logic
-                parsed = self._parse_fallback_response(full_accum)
-                
-                intent = getattr(parsed, 'intent', 'unknown')
-                should_end = False
-                if hasattr(parsed, 'end_call') and str(parsed.end_call).lower() in ('yes', 'true', '1'):
-                     should_end = True
-                elif hasattr(parsed, 'callback_scheduled') and str(parsed.callback_scheduled).lower() == 'yes':
-                     should_end = True
+                # 1. Prepare Prompt
+                formatted_prompt = self.format_system_prompt(**format_values)
+                system_prompt = self.generate_system_prompt(formatted_prompt)
 
-                self.last_response_meta = {
-                    "response": parsed,
-                    "spoken_text": final_text,
-                    "intent": intent,
-                    "should_end_call": should_end,
-                    "raw_model_data": parsed.model_dump(),
-                    "raw_response": full_accum
+                history = list(conversation_history or self.get_conversation_history())
+                if len(history) > 6:
+                    history = history[-6:]
+
+                messages = [
+                    {"role": "system", "content": system_prompt},
+                    *history,
+                    {"role": "user", "content": user_input},
+                ]
+                
+                # 2. Determine Model
+                default_model = "llama-4-maverick"
+                model = os.getenv("GROQ_MODEL", getattr(config, "GROQ_PRIMARY_MODEL", default_model))
+                
+                # 3. Prepare API Call
+                api_payload = {
+                    "model": model,
+                    "messages": messages,
+                    "temperature": config.LLM_TEMPERATURE,
+                    "top_p": config.LLM_TOP_P,
+                    "max_tokens": config.MAX_LLM_TOKENS,
+                    "stream": True
                 }
-            except Exception as e:
-                logger.error(f"[GROQ] Meta parse failed: {e}")
                 
-        except Exception as e:
-            logger.error(f"[ERROR] Groq stream_response failed: {e}", exc_info=True)
-            yield "I apologize, I'm having a system issue.", True, None
-            self.last_response_meta = self._get_default_response()
+                # REMOVED strict JSON mode to avoid 'json_validate_failed' errors
+                # We rely on the system prompt and robust parsing instead
+                # if "llama-4" in model.lower() or "70b" in model:
+                #    api_payload["response_format"] = {"type": "json_object"}
+                
+                # 4. Execute Stream (Accumulate)
+                full_accum = ""
+                api_start = time.time()
+                stream_error = None
+                
+                async with self.session.post(
+                    config.GROQ_URL,
+                    headers={
+                        "Authorization": f"Bearer {self.api_key}",
+                        "Content-Type": "application/json"
+                    },
+                    json=api_payload
+                ) as response:
+                
+                    if response.status != 200:
+                        text_err = await response.text()
+                        logger.warning(f"[GROQ] Stream error {response.status}: {text_err}")
+                        stream_error = f"HTTP {response.status}"
+                        # Trigger retry
+                        retry_count += 1
+                        continue
+
+                    # Read lines for SSE
+                    async for line in response.content:
+                        line = line.strip()
+                        if not line or line == b'data: [DONE]':
+                            continue
+                            
+                        if line.startswith(b'data: '):
+                            chunk_str = line[6:].decode('utf-8')
+                            try:
+                                chunk_json = json.loads(chunk_str)
+                                # Check for error in chunk
+                                if 'error' in chunk_json:
+                                    logger.warning(f"[GROQ] Chunk error: {chunk_json['error']}")
+                                    stream_error = "Chunk Error"
+                                    break
+                                    
+                                delta = chunk_json.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                                if delta:
+                                    full_accum += delta
+                            except Exception:
+                                pass
+                
+                if stream_error:
+                    retry_count += 1
+                    continue
+                    
+                # 5. Process Full Response
+                api_time = time.time() - api_start
+                
+                # Log RAW content for debugging (Fix 5: Intent Unknown)
+                logger.info(f"[GROQ RAW] {full_accum[:500]}")
+                
+                if not full_accum.strip():
+                    logger.warning("[GROQ] Empty response received")
+                    retry_count += 1
+                    continue
+
+                # Parsing logic using robust extraction
+                final_text = ""
+                try:
+                    # Robust extraction (Fix 2A: Sanitize newlines)
+                    # Replace literal newlines within string values to escaped \n before parsing
+                    sanitized = full_accum.replace('\r\n', '\\n').replace('\n', '\\n')
+                    data = self._extract_json(sanitized)
+                    final_text = data.get("assistant_text") or data.get("response") or ""
+                except Exception as e:
+                    logger.warning(f"[GROQ] JSON Parse Failed: {e}")
+                    # Regex fallback for text
+                    m = re.search(r'"assistant_text"\s*:\s*"((?:[^"\\]|\\.)*)"', full_accum, re.DOTALL)
+                    if m:
+                        try:
+                            final_text = m.group(1).encode('utf-8').decode('unicode_escape')
+                        except:
+                            final_text = m.group(1)
+                
+                if not final_text and not full_accum.strip().startswith("{"):
+                     # If it's just text (model ignored JSON instr completely), use it
+                     final_text = full_accum.strip()
+                
+                # Extract Emotion
+                emotion = None
+                emotion_match = re.search(r"\[EMOTION:\s*([a-z]+)\]\s*$", final_text, re.IGNORECASE | re.MULTILINE)
+                if emotion_match:
+                    emotion = emotion_match.group(1).lower()
+                    final_text = final_text[:emotion_match.start()].strip()
+                
+                logger.info(f"[GROQ] Full stream received in {api_time:.2f}s ({len(full_accum)} chars) | intent=unknown | emotion={emotion}")
+                
+                yield final_text, True, emotion
+                
+                # 6. Parse Meta
+                try:
+                    # Reuse existing parsing logic
+                    parsed = self._parse_fallback_response(full_accum)
+                    
+                    intent = getattr(parsed, 'intent', 'unknown')
+                    should_end = False
+                    if hasattr(parsed, 'end_call') and str(parsed.end_call).lower() in ('yes', 'true', '1'):
+                         should_end = True
+                    elif hasattr(parsed, 'callback_scheduled') and str(parsed.callback_scheduled).lower() == 'yes':
+                         should_end = True
+
+                    self.last_response_meta = {
+                        "response": parsed,
+                        "spoken_text": final_text,
+                        "intent": intent,
+                        "should_end_call": should_end,
+                        "raw_model_data": parsed.model_dump(),
+                        "raw_response": full_accum
+                    }
+                except Exception as e:
+                    logger.error(f"[GROQ] Meta parse failed: {e}")
+                
+                # Success - break retry loop
+                return
+                
+            except Exception as e:
+                logger.error(f"[ERROR] Groq stream_response attempt {retry_count+1} failed: {e}", exc_info=True)
+                retry_count += 1
+        
+        # If all retries fail
+        yield "I apologize, I'm having a connection issue.", True, None
+        self.last_response_meta = self._get_default_response()
+
+    def _extract_json(self, text: str) -> dict:
+        """Robustly extract JSON object from text, handling markdown and prefixes."""
+        import re
+        import json
+        
+        text = text.strip()
+        
+        # 1. Strip markdown code fences
+        text = re.sub(r'^```json\s*', '', text, flags=re.MULTILINE)
+        text = re.sub(r'^```\s*', '', text, flags=re.MULTILINE)
+        text = re.sub(r'\s*```$', '', text, flags=re.MULTILINE)
+        
+        # 2. Try direct load
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            pass
+            
+        # 3. Find first { and last }
+        match = re.search(r'\{.*\}', text, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group())
+            except json.JSONDecodeError:
+                pass
+        
+        raise ValueError(f"No valid JSON object found in response: {text[:200]}")
 
 
 # Convenience function for quick initialization
