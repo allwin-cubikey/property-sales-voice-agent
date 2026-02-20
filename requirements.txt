@@ -8,6 +8,8 @@ deepgram-sdk<5.0
 cartesia
 python-dotenv
 groq
+openai
 aiofiles
 pyaudio
 pydub
+smallestai

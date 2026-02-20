@@ -7,12 +7,15 @@ without telephony integration for the Property Enquiry Agent.
 import asyncio
 import json
 import logging
+import queue
+import threading
 import pyaudio
 import audioop
 import signal
 import sys
 import wave
 import os
+import time
 from datetime import datetime
 from typing import Dict, Optional, List
 
@@ -22,6 +25,9 @@ from prompts import STAGE_DEFINITIONS
 from services.stt_factory import STTServiceFactory
 from services.tts_factory import TTSServiceFactory
 from services.llm_service import GroqLLMService
+from services.openai_llm_service import OpenAILLMService
+import emotion_config
+from utils.audio_utils import mulaw_to_pcm
 
 logging.basicConfig(
     level=logging.INFO,
@@ -92,16 +98,37 @@ STOP_WORDS = [
 ]
 
 # Timeout settings
-RECORD_TIMEOUT = 25  # seconds - reduced from 30 of silence before auto-shutdown
+RECORD_TIMEOUT = 60  # seconds - increased for better UX
+SILENCE_PROMPT_TIMEOUT = 30 # seconds - prompt user if quiet for this long
+
+
+# ---------------------------------------------------------------------------
+# Emotion extraction utility
+# ---------------------------------------------------------------------------
+import re as _re
+_EMOTION_TAG_RE = _re.compile(r'\[EMOTION:\s*([a-z]+)\]\s*$', _re.IGNORECASE | _re.MULTILINE)
+
+def extract_emotion(text: str):
+    """
+    Find and strip the [EMOTION: <name>] tag appended by the LLM.
+    Returns (clean_text, emotion_name) where emotion_name is None if tag absent.
+    """
+    match = _EMOTION_TAG_RE.search(text)
+    if match:
+        clean = text[:match.start()].rstrip()
+        return clean, match.group(1).lower()
+    return text, None
 
 
 class LocalVoiceClient:
     """Local voice client for testing property enquiry voice services."""
+
     
     def __init__(self, user_name: str = None, user_message: str = None):
         # User data (can be set from form or use defaults)
         self.user_name = user_name or DEFAULT_USER_NAME
         self.user_message = user_message or DEFAULT_USER_MESSAGE
+        self._prompted_silence = False
         
         # Format name for greeting (remove initial if present)
         self.greeting_name = self._format_name_for_greeting(self.user_name)
@@ -124,6 +151,7 @@ class LocalVoiceClient:
         self.completed_stages = []
         self.current_stage = "identity_check"
         self.is_processing = False  # Prevent concurrent LLM calls
+        self.stt_muted = False      # Mute STT during playback to prevent echo
         
         # Slots — source of truth for extracted data
         self.slots = {
@@ -161,8 +189,17 @@ class LocalVoiceClient:
             os.makedirs(self.recordings_dir, exist_ok=True)
             logger.info(f"[RECORDING] Enabled - saving to {self.recordings_dir}/")
         
+        # Dedicated audio playback thread — PyAudio must be written from a single
+        # tight loop thread to avoid buffer underruns (static/crackle).
+        self._pcm_queue: queue.Queue = queue.Queue(maxsize=500)
+        self._audio_thread: threading.Thread = None
+        self._audio_thread_stop = threading.Event()
+        
         # Setup signal handler for graceful shutdown
         signal.signal(signal.SIGINT, self._signal_handler)
+        
+        # Guard flag for playback finished callback
+        self._playback_callback_fired = False
     
     def _signal_handler(self, sig, frame):
         """Handle Ctrl+C gracefully."""
@@ -228,15 +265,21 @@ class LocalVoiceClient:
             
             # Initialize TTS
             print(f"[TTS] Creating {config.TTS_PROVIDER.title()} TTS service...")
-            tts_api_key = (
-                config.CARTESIA_API_KEY if config.TTS_PROVIDER == 'cartesia'
-                else config.SARVAM_API_KEY
-            )
-            
             if config.TTS_PROVIDER == 'cartesia':
+                tts_api_key = config.CARTESIA_API_KEY
                 voice_id = config.CARTESIA_VOICE_ID
                 tts_kwargs = {'model_id': 'sonic-english', 'speed': 'normal'}
+            elif config.TTS_PROVIDER == 'deepgram':
+                tts_api_key = config.DEEPGRAM_API_KEY
+                # config.VOICE_ID is already set correctly in config.py update
+                voice_id = getattr(config, 'VOICE_ID', 'aura-orion-en') 
+                tts_kwargs = {}
+            elif config.TTS_PROVIDER == 'smallest':
+                tts_api_key = config.SMALLEST_API_KEY
+                voice_id = getattr(config, 'VOICE_ID', 'emily')
+                tts_kwargs = {'model': getattr(config, 'SMALLEST_MODEL', 'lightning-v2')}
             else:
+                tts_api_key = config.SARVAM_API_KEY
                 voice_id = config.SARVAM_VOICE_ID or 'rohan'
                 tts_kwargs = {
                     'model': config.SARVAM_MODEL or 'bulbul:v3',
@@ -250,19 +293,37 @@ class LocalVoiceClient:
                 voice_id=voice_id,
                 **tts_kwargs
             )
+            
+            # SMALLST: Initial connect here for persistence
+            if config.TTS_PROVIDER == 'smallest':
+                await self.tts_service.connect()
+                
             await self.tts_service.initialize()
             print(f"[TTS] OK - {config.TTS_PROVIDER.title()} TTS initialized")
             
-            # Initialize LLM
-            print(f"[LLM] Creating Groq LLM service...")
-            self.llm_service = GroqLLMService(api_key=config.GROQ_API_KEY, max_history=10)
+            # Pre-warm TTS if Sarvam to reduce first-request latency
+            if config.TTS_PROVIDER == 'sarvam':
+                print("[TTS] Pre-warming Sarvam connection...")
+                try:
+                    await self.tts_service.prewarm_tts()
+                except AttributeError:
+                    pass # Method might not exist on all service variations yet
+
             
-            # Pass raw prompt template — runtime context formatted per-turn via format_values
+            # Initialize LLM — toggle via LLM_PROVIDER env var
+            if config.LLM_PROVIDER == "openai":
+                print(f"[LLM] Creating OpenAI LLM service (model: {config.OPENAI_MODEL})...")
+                self.llm_service = OpenAILLMService(api_key=config.OPENAI_API_KEY, max_history=10)
+            else:
+                print(f"[LLM] Creating Groq LLM service...")
+                self.llm_service = GroqLLMService(api_key=config.GROQ_API_KEY, max_history=10)
+
+            # Pass raw prompt template -- runtime context formatted per-turn via format_values
             await self.llm_service.initialize(
                 dynamic_fields=BRIGADE_ETERNIA_DYNAMIC_FIELDS,
                 system_prompt_template=prompts.BRIGADE_ETERNIA_SYSTEM_PROMPT
             )
-            print(f"[LLM] OK - Groq LLM initialized")
+            print(f"[LLM] OK - {config.LLM_PROVIDER.upper()} LLM initialized")
             
             print("=" * 60)
             print("SUCCESS - All services initialized!")
@@ -291,14 +352,20 @@ class LocalVoiceClient:
             )
             
             # Output stream (speakers)
+            # SMALLST: Lightning native rate is 24000Hz
+            output_rate = 24000 if config.TTS_PROVIDER == 'smallest' else SAMPLE_RATE
+            
             self.output_stream = self.audio.open(
                 format=FORMAT,
                 channels=CHANNELS,
-                rate=SAMPLE_RATE,
+                rate=output_rate,
                 output=True,
                 frames_per_buffer=CHUNK_SIZE
             )
             
+            print(f"[AUDIO] STT input stream:  {SAMPLE_RATE} Hz, mono, paInt16")
+            # Note: Sarvam TTS output is confirmed to be 16000 Hz
+            print(f"[AUDIO] TTS output stream: {output_rate} Hz, mono, paInt16")
             print("[AUDIO] OK - Audio streams ready")
             return True
             
@@ -321,6 +388,11 @@ class LocalVoiceClient:
                 try:
                     # Read audio chunk from microphone
                     try:
+                        # Non-blocking read check
+                        if self.input_stream.get_read_available() < CHUNK_SIZE:
+                            await asyncio.sleep(0.01)
+                            continue
+                            
                         pcm_data = self.input_stream.read(CHUNK_SIZE, exception_on_overflow=False)
                     except IOError as e:
                         # Handle "Unanticipated host error" (often temporary)
@@ -330,10 +402,16 @@ class LocalVoiceClient:
                         raise e
                     
                     # ACOUSTIC FEEDBACK PREVENTION FOR RECORDING:
-                    # Only add mic data to the recording buffer if AI is NOT playing.
-                    # This prevents the AI's voice from being captured twice (direct + echo).
-                    if not self.is_playing:
-                        self.add_to_recording(pcm_data)
+                    # If muted (TTS sequencing) or playing (audio active), discard mic input
+                    if self.stt_muted or self.is_playing:
+                        # Echo suppression active - do not send to STT
+                        # print("M", end="", flush=True) # Muted
+                        await asyncio.sleep(0.01)
+                        continue
+
+                    # logger.debug("Reading audio...")
+                    self.add_to_recording(pcm_data)
+                    # logger.debug("Read audio")
 
                     # Send raw PCM directly — Deepgram is configured for linear16/16kHz
                     if config.STT_PROVIDER == 'deepgram':
@@ -342,22 +420,12 @@ class LocalVoiceClient:
                         stt_audio = pcm_data  # Sarvam also takes raw PCM
 
                     if not self.is_farewell:
-                        if not self.is_playing:
-                            if self.stt_service:
-                                await self.stt_service.process_audio(stt_audio)
+                        if self.stt_service:
+                            # print(".", end="", flush=True) # Sending
+                            await self.stt_service.process_audio(stt_audio)
                         else:
-                            rms = audioop.rms(pcm_data, 2)
-                            if rms > self.interruption_threshold:
-                                if not self.is_user_speaking:
-                                    self.is_user_speaking = True
-                                    logger.info(f"[INTERRUPT] User voice detected RMS:{rms} - stopping TTS immediately")
-                                    self.is_playing = False
-                                    if self.tts_service:
-                                        await self.tts_service.stop()
-                                if self.stt_service:
-                                    await self.stt_service.process_audio(stt_audio)
-                            else:
-                                self.is_user_speaking = False
+                            pass # print("X", end="", flush=True) # No Service
+                    
                     # Small sleep to prevent CPU overload
                     await asyncio.sleep(0.001)
                     
@@ -371,26 +439,85 @@ class LocalVoiceClient:
         finally:
             self.is_recording = False
     
+    def _audio_playback_thread(self):
+        """
+        Dedicated audio thread — owns all PyAudio writes.
+        Reads PCM data from _pcm_queue and writes to output_stream in a tight loop.
+        Running writes in a dedicated thread (vs thread pool) gives consistent
+        inter-write timing, eliminating buffer underruns that cause static/crackle.
+        """
+        logger.info("[AUDIO THREAD] Started")
+        while not self._audio_thread_stop.is_set():
+            try:
+                pcm_data = self._pcm_queue.get(timeout=0.05)
+                if pcm_data is None:  # sentinel — stop the thread
+                    self._pcm_queue.task_done()
+                    break
+                if self.output_stream and not self.output_stream.is_stopped():
+                    self.output_stream.write(pcm_data)
+                self._pcm_queue.task_done()
+            except queue.Empty:
+                continue
+            except Exception as e:
+                if not self._audio_thread_stop.is_set():
+                    err = str(e)
+                    if "Stream closed" not in err and "-9988" not in err:
+                        logger.error(f"[AUDIO THREAD] Write error: {e}")
+                self._pcm_queue.task_done() if not self._pcm_queue.empty() else None
+        logger.info("[AUDIO THREAD] Stopped")
+
+    def _ensure_audio_thread(self):
+        """Start the audio playback thread if it's not already running."""
+        if self._audio_thread is None or not self._audio_thread.is_alive():
+            self._audio_thread_stop.clear()
+            self._audio_thread = threading.Thread(
+                target=self._audio_playback_thread,
+                daemon=True,
+                name="AudioPlayback"
+            )
+            self._audio_thread.start()
+            logger.info("[AUDIO THREAD] Launched dedicated playback thread")
+
     async def play_audio(self, audio_chunk: bytes, action: str):
         """Play audio through speakers."""
         try:
             if action == "clearAudio":
                 logger.info("[AUDIO] Clear audio buffer")
+                # Drain the queue without playing
+                while not self._pcm_queue.empty():
+                    try:
+                        self._pcm_queue.get_nowait()
+                        self._pcm_queue.task_done()
+                    except queue.Empty:
+                        break
                 return
             
             if action == "finishAudio":
-                # Don't set is_playing=False here - audio still playing through speakers
-                # It gets set False after actual playback completes via asyncio.sleep
-                logger.info("[AUDIO] All chunks sent - waiting for playback to finish")
-                # Estimate remaining playback time based on last chunk size
-                await asyncio.sleep(0.3)  # Buffer for speaker playback drain
+                if self._playback_callback_fired:
+                    return
+                self._playback_callback_fired = True
+                
+                # logger.info("[AUDIO] Waiting for playback to nearly finish...")
+                # Poll queue until ~100ms remains (approx 5 chunks @ 20ms/chunk)
+                # This unblocks STT earlier so we catch user's first words
+                while self._pcm_queue.qsize() > 5:
+                    await asyncio.sleep(0.02)
+                
+                # allow room reverb to settle
+                await asyncio.sleep(0.5)
+                
+                self.stt_muted = False    # Unmute STT (resume listening)
                 self.is_playing = False
-                logger.info("[AUDIO] Playback finished")
+                logger.info("[AUDIO] Playback finished + 500ms delay - listening resumed")
+                
+                # Optional: continue waiting for full drain if needed, but returning early allows flow to proceed
                 return
             
             if action == "playAudio" and audio_chunk:
+                self._playback_callback_fired = False  # Reset flag for new playback
                 if not self.is_playing:
                     self.is_playing = True
+                    self._ensure_audio_thread()
                 
                 if not self.output_stream:
                     logger.warning("[AUDIO] Output stream not available")
@@ -405,14 +532,16 @@ class LocalVoiceClient:
                 # Add to recording
                 self.add_to_recording(pcm_data)
                 
-                # Play through speakers
-                if self.output_stream:
-                    self.output_stream.write(pcm_data)
+                # Enqueue for audio thread — instant, non-blocking, event loop stays free
+                try:
+                    self._pcm_queue.put_nowait(pcm_data)
+                except queue.Full:
+                    logger.warning("[AUDIO] PCM queue full — dropping chunk to avoid lag")
                     
         except Exception as e:
             error_msg = str(e)
             if "Stream closed" not in error_msg and "-9988" not in error_msg:
-                logger.error(f"[ERROR] Error playing audio: {e}")
+                logger.error(f"[ERROR] Error in play_audio: {e}")
             self.is_playing = False
     
     async def check_silence_timeout(self):
@@ -428,6 +557,30 @@ class LocalVoiceClient:
                 if self.last_user_speech_time:
                     silence_duration = datetime.now().timestamp() - self.last_user_speech_time
                     
+                    # 1. 30s Check-in Prompt
+                    if silence_duration >= SILENCE_PROMPT_TIMEOUT and not self._prompted_silence:
+                        self._prompted_silence = True
+                        msg = "Are you still there?"
+                        logger.info(f"[TIMEOUT] Sending check-in prompt: '{msg}'")
+                        
+                        # Use TTS to prompt
+                        async def prompt_callback(chunk, action):
+                            await self.play_audio(chunk, action)
+                        
+                        if config.TTS_PROVIDER in ('deepgram', 'smallest'):
+                            receive_task = asyncio.create_task(
+                                self.tts_service.receive_audio(prompt_callback)
+                            )
+                            await self.tts_service.send_text(msg)
+                            await receive_task
+                        else:
+                            await self.tts_service.synthesize(msg, prompt_callback)
+                        
+                        await self.play_audio(b"", "finishAudio")
+                        # Reset timer slightly so we don't immediately hit the 60s shutdown
+                        # self.last_user_speech_time = datetime.now().timestamp()
+                    
+                    # 2. 60s Hard Timeout
                     if silence_duration >= RECORD_TIMEOUT:
                         print(f"\\n[TIMEOUT] No speech detected for {RECORD_TIMEOUT} seconds")
                         await self.graceful_shutdown()
@@ -882,6 +1035,13 @@ class LocalVoiceClient:
                 if has_word(text_lower, positive):
                     if "identity_check" not in self.completed_stages:
                         self.completed_stages.append("identity_check")
+                    self.current_stage = "self_intro"  # Always introduce before timing check
+
+            elif self.current_stage == "self_intro":
+                # Any response from user after intro → move to timing check
+                if len(text_lower.strip()) > 0:
+                    if "self_intro" not in self.completed_stages:
+                        self.completed_stages.append("self_intro")
                     self.current_stage = "timing_check"
 
             elif self.current_stage == "timing_check":
@@ -914,11 +1074,13 @@ class LocalVoiceClient:
                     self.current_stage = "site_visit_scheduling"
 
             elif self.current_stage == "site_visit_scheduling":
-                time_words = ["tomorrow", "today", "weekend", "monday", "tuesday",
-                              "wednesday", "thursday", "friday", "saturday", "sunday",
-                              "morning", "evening", "afternoon", "night", "next week",
-                              "next month", "this week", "this month", "next year"]
-                if has_word(text_lower, time_words):
+                past_date_phrases = ["last week", "last month", "yesterday", "day before", "last year"]
+                is_past = any(p in text_lower for p in past_date_phrases) or self._is_past_date(text_lower)
+                future_time_words = ["tomorrow", "today", "weekend", "monday", "tuesday",
+                                     "wednesday", "thursday", "friday", "saturday", "sunday",
+                                     "morning", "evening", "afternoon", "night", "next week",
+                                     "next month", "this week", "this month", "next year"]
+                if not is_past and has_word(text_lower, future_time_words):
                     self.current_stage = "post_visit_confirmed"
 
             logger.info(f"[STAGE] Current: {self.current_stage} | Done: {self.completed_stages}")
@@ -945,8 +1107,21 @@ class LocalVoiceClient:
                         await _speak_and_return(rejection, "reschedule")
                         return
                     else:
-                        # Valid time — clear flag, let LLM confirm and end call
+                        # Valid time — confirm directly without going to LLM
+                        # (If LLM handles this, it sometimes re-validates and re-asks incorrectly)
                         self._awaiting_callback_time = False
+                        self.slots["callback_scheduled"] = "yes"
+                        
+                        # Format extracted hour for speech
+                        formatted_time = f"{hour - 12} PM" if hour > 12 else (f"{hour} PM" if hour == 12 else f"{hour} AM")
+                        if hour == 0: formatted_time = "12 AM"
+                        if hour == 12: formatted_time = "12 PM"
+                        
+                        logger.info(f"[CALLBACK] Valid time accepted (hour={hour}): '{text}' — confirming directly")
+                        confirmation = f"Perfect, I'll schedule a callback for you at {formatted_time}. You'll receive a confirmation on WhatsApp shortly. It was a pleasure speaking with you — have a great day, {self.greeting_name}!"
+                        await _speak_and_return(confirmation, "reschedule")
+                        await self.graceful_shutdown()
+                        return
                 else:
                     # No hour detected — re-ask instead of falling through to LLM
                     re_ask = "Could you please tell me a specific time for the callback? For example, tomorrow at 3 PM."
@@ -969,6 +1144,9 @@ class LocalVoiceClient:
                 else:
                     # Valid — clear flag, let LLM confirm
                     self._awaiting_visit_datetime = False
+                
+            # Reset silence prompt flag whenever user speaks
+            self._prompted_silence = False
 
             # Add user message to conversation history
             self.conversation_history.append({"role": "user", "content": text})
@@ -983,17 +1161,145 @@ class LocalVoiceClient:
                 "current_date": datetime.now().strftime("%B %d, %Y")
             }
 
-            # STEP 3: Call LLM with clean user text + conversation context
-            # Pass last 10 messages so LLM has memory of the conversation
+            # STEP 3: Stream LLM response (Full) → dispatch to Deepgram WebSocket
+            # We accumulate the full response then send it as one clean text block.
+            # Deepgram handles the streaming audio generation.
             recent_history = self.conversation_history[-10:] if self.conversation_history else []
-            response = await self.llm_service.generate_response(
-                user_input=text,
-                conversation_history=recent_history,
-                format_values=format_values
-            )
+            stream_start = time.time()
 
-            # STEP 4: Extract response using new schema
-            ai_text = response.get("spoken_text", "")
+            # Architecture Check: Deepgram WebSocket vs Legacy REST
+            is_streaming_tts = config.TTS_PROVIDER in ('deepgram', 'smallest')
+            
+            # Pipeline components
+            receive_task = None
+            
+            if is_streaming_tts:
+                # ─── DEEPGRAM WEBSOCKET PIPELINE ────────────────────────────
+                # Connection is already persistent from start_session
+                # Just start receiver task
+                
+                # 2. Start receiver task
+                async def on_audio_chunk(chunk: bytes):
+                    if not self.stt_muted and chunk:
+                        self.stt_muted = True 
+                        # TTFB Log
+                        print(f"[{config.TTS_PROVIDER.upper()}] First audio bytes received")
+                    
+                    if chunk:
+                        await self.play_audio(chunk, "playAudio")
+
+                receive_task = asyncio.create_task(
+                    self.tts_service.receive_audio(on_audio_chunk)
+                )
+
+            stream_start = time.time()
+            full_ai_text = ""
+            final_emotion = None
+            
+            # 3. Get API response (now yields once with full text)
+            # Retry loop for self-intro check
+            max_retries = 1
+            retry_count = 0
+            
+            while retry_count <= max_retries:
+                full_ai_text = ""
+                final_emotion = None
+                
+                async for chunk_text, is_final, emotion in self.llm_service.stream_response(
+                    user_input=text,
+                    conversation_history=recent_history,
+                    format_values=format_values,
+                ):
+                     full_ai_text = chunk_text
+                     final_emotion = emotion
+                
+                # Self-Intro Hard Check
+                if self.current_stage == "self_intro" and not is_streaming_tts:
+                    # Check if agent introduced itself
+                    if "rohan" not in full_ai_text.lower():
+                        if retry_count < max_retries:
+                            logger.warning(f"[SELF-INTRO] Agent failed to introduce itself. Retrying... (Attempt {retry_count+1})")
+                            print("[RETRY] Agent forgot name in self-intro. Triggering retry...")
+                            # Add explicit instruction to history for the retry
+                            recent_history.append({"role": "system", "content": "CRITICAL: You MUST introduce yourself as 'Rohan from JLL Homes' in this turn. Do it now."})
+                            retry_count += 1
+                            continue
+                        else:
+                            logger.error("[SELF-INTRO] Failed to introduce after retry.")
+                            break
+                    else:
+                        break # Success
+                else:
+                    break # Not self-intro stage or streaming mode (can't retry easily)
+
+            elapsed = time.time() - stream_start
+            logger.info(f"[LLM] Response complete in {elapsed:.2f}s ({len(full_ai_text)} chars) → sending to TTS")
+
+            if is_streaming_tts:
+                 if full_ai_text:
+                      # Send full text
+                      await self.tts_service.send_text(full_ai_text)
+                      if hasattr(self.tts_service, 'flush'):
+                          await self.tts_service.flush()
+                      print(f"[{config.TTS_PROVIDER.upper()}] Text sent — waiting for audio")
+                      
+                      if receive_task:
+                           await receive_task
+                      
+                      # Keep connection alive between turns
+                      if hasattr(self.tts_service, 'keepalive'):
+                          await self.tts_service.keepalive()
+                      elif hasattr(self.tts_service, 'keep_alive'):
+                          await self.tts_service.keep_alive()
+            else:
+                 # Legacy Fallback (Synthesize full text as one chunk)
+                 if full_ai_text:
+                     print("[TTS] Synthesizing full response (Legacy)...")
+                     try:
+                         # Use standard synthesize method with callback
+                         # import emotion_config as _ec
+                         # params = _ec.get_emotion_params(final_emotion or "default")
+                         
+                         async def legacy_audio_callback(chunk, action="playAudio"):
+                             if chunk:
+                                 self.stt_muted = True
+                                 await self.play_audio(chunk, action)
+                         
+                         await self.tts_service.synthesize(full_ai_text, legacy_audio_callback)
+                     except Exception as e:
+                         logger.error(f"[TTS] Legacy synthesis failed: {e}")
+            
+            elapsed_total = time.time() - stream_start
+            logger.info(f"[TIMING] Turn handling complete in {elapsed_total:.2f}s")
+            
+            # Add to history
+            if full_ai_text:
+                # Add full AI text to history logic...
+                # Note: We append the emotion tag for the history record so it persists
+                full_ai_text_with_emotion = full_ai_text
+                if final_emotion:
+                     full_ai_text_with_emotion += f"\n[EMOTION: {final_emotion}]"
+                elif not final_emotion and "[EMOTION:" not in full_ai_text:
+                     # Attempt to re-extract if it was stripped but not captured in final_emotion
+                     pass 
+                
+                self.conversation_history.append({"role": "assistant", "content": full_ai_text_with_emotion})
+                
+                # Wait for all audio to finish playing
+                await self.play_audio(b"", "finishAudio")
+
+            # Retrieve meta parsed from the full JSON (intent, slots, end_call, etc.)
+            response = self.llm_service.last_response_meta
+            ai_text  = full_ai_text.strip()
+
+            # STEP 4b: Strip any residual emotion tag from assembled text (safety net)
+            ai_text, _residual_emotion = extract_emotion(ai_text)
+            if not final_emotion:
+                final_emotion = _residual_emotion
+            
+            # Unit-level Debug Log for Emotion
+            if not final_emotion:
+                logger.debug(f"[EMOTION CHECK] Emotion is None. Raw AI text end: '{ai_text[-100:] if len(ai_text) > 100 else ai_text}'")
 
             if not ai_text or not ai_text.strip():
                 logger.error("[ERROR] LLM returned empty response")
@@ -1002,22 +1308,44 @@ class LocalVoiceClient:
             intent = response.get("intent", "unknown")
             print(f"[RESPONSE] AI ({intent}): {ai_text}")
 
-            # Add AI response to conversation history
-            self.conversation_history.append({"role": "assistant", "content": ai_text})
-            
-            # Set flag if LLM is asking for callback time (NOT site visit time)
-            callback_ask_phrases = ["when would be a good time", "what time works", "when can i call", "when should i call"]
+            # REMOVED duplicate history append: self.conversation_history.append({"role": "assistant", "content": ai_text})
+
+            # ─────────────────────────────────────────────────────────
+            # CALLBACK TIME FLAG DETECTION
+            # Set _awaiting_callback_time whenever the LLM's reply is
+            # offering/asking for a callback time — regardless of intent label.
+            # Use a broad phrase set to catch all LLM phrasings.
+            # ─────────────────────────────────────────────────────────
+            callback_ask_phrases = [
+                "when would be a good time",
+                "what time works",
+                "when can i call",
+                "when should i call",
+                "let me know what time",
+                "works best for you",
+                "prefer a callback",
+                "schedule a callback",
+                "best time to reach",
+                "when to call",
+                "when would work",
+                "good time for a callback",
+                "time for a callback",
+                "callback at what time",
+                "when are you free",
+                "when would you be free",
+                "between 8 am and 9 pm",
+                "between 8am and 9pm",
+            ]
             visit_phrases = ["site visit", "visit the site", "schedule a visit", "visit us", "come visit"]
             is_asking_callback_time = (
-                intent == "reschedule"
-                and any(p in ai_text.lower() for p in callback_ask_phrases)
+                any(p in ai_text.lower() for p in callback_ask_phrases)
                 and not any(p in ai_text.lower() for p in visit_phrases)
             )
             if is_asking_callback_time:
                 self._awaiting_callback_time = True
                 logger.info("[CALLBACK] Now awaiting callback time from user")
-            elif intent != "reschedule":
-                # Clear the flag if we've moved away from reschedule flow
+            elif intent not in ("reschedule", "flow_progress"):
+                # Only clear the flag if we've moved to a clearly unrelated intent
                 self._awaiting_callback_time = False
 
             # Set flag if LLM is asking for site visit date/time
@@ -1036,7 +1364,7 @@ class LocalVoiceClient:
             # Reset silence timer after LLM responds
             self.last_user_speech_time = datetime.now().timestamp()
 
-            # STEP 5: Update slots from LLM output
+            # STEP 5: Update slots from LLM output (parsed from full JSON after stream end)
             if "raw_model_data" in response:
                 raw_data = response["raw_model_data"]
                 self.collected_data = raw_data
@@ -1048,21 +1376,13 @@ class LocalVoiceClient:
                         self.slots[slot_key] = val
                 
                 logger.info(f"[SLOTS] {self.slots}")
-            
-            # Synthesize response
-            print("[SPEAKING] Playing audio...")
-            
-            async def audio_callback(audio_chunk: bytes, action: str):
-                await self.play_audio(audio_chunk, action)
 
-            # Detect farewell and set flag BEFORE synthesizing
+            # Detect farewell BEFORE checking end-call so we can block STT
             farewell_phrases = ["have a wonderful day", "have a great day", "pleasure speaking"]
             if any(phrase in ai_text.lower() for phrase in farewell_phrases):
                 self.is_farewell = True
                 self.call_ended = True
                 logger.info("[LOCAL] Farewell detected - blocking STT")
-
-            await self.tts_service.synthesize(self._clean_for_tts(ai_text), audio_callback)
 
             # Check if should end call AFTER TTS finishes
             if response.get("should_end_call") or self.call_ended:
@@ -1101,13 +1421,41 @@ class LocalVoiceClient:
 
             # Add to LLM's internal history so it knows Stage 1 was already said
             self.llm_service.add_to_history("assistant", welcome_greeting)
+            # Add to local conversation history for persistent context across turns
+            self.conversation_history.append({"role": "assistant", "content": welcome_greeting})
             self.current_stage = "identity_check"
-            logger.info(f"[STAGE] Welcome greeting added to LLM history: {welcome_greeting}")
+            logger.info(f"[STAGE] Welcome greeting added to history: {welcome_greeting}")
 
-            async def welcome_callback(audio_chunk: bytes, action: str):
+            async def welcome_callback(audio_chunk: bytes, action: str = "playAudio"):
+                if not self.stt_muted and audio_chunk:
+                    self.stt_muted = True
+                    print(f"[{config.TTS_PROVIDER.upper()}] Greeting started — STT muted")
                 await self.play_audio(audio_chunk, action)
 
-            await self.tts_service.synthesize(welcome_greeting, welcome_callback)
+            if config.TTS_PROVIDER in ('deepgram', 'smallest'):
+                # Start receiver task FIRST so we don't miss any chunks
+                receive_task = asyncio.create_task(
+                    self.tts_service.receive_audio(welcome_callback)
+                )
+                
+                # Send text into existing connection
+                await self.tts_service.send_text(welcome_greeting)
+                
+                if config.TTS_PROVIDER != 'smallest' and hasattr(self.tts_service, 'flush'):
+                    await self.tts_service.flush()
+
+                # Wait for turn completion
+                await receive_task
+                
+                # Reset muting for welcome greeting finishes
+                self.stt_muted = False
+                print(f"[{config.TTS_PROVIDER.upper()}] Greeting finished — STT unmuted")
+            else:
+                await self.tts_service.synthesize(welcome_greeting, welcome_callback)
+                self.stt_muted = False
+            
+            # Reset playback state so we can start listening
+            await self.play_audio(b"", "finishAudio")
             
             # Initialize timeout tracking
             self.last_user_speech_time = datetime.now().timestamp()
@@ -1127,6 +1475,8 @@ class LocalVoiceClient:
     
     async def cleanup(self):
         """Clean up resources."""
+        if self.tts_service:
+            await self.tts_service.close()
         try:
             print("\\n[CLEANUP] Closing services...")
             
@@ -1150,7 +1500,17 @@ class LocalVoiceClient:
             if self.llm_service:
                 await self.llm_service.close()
             
-            # 6. Close audio hardware LAST
+            # 6. Stop dedicated audio thread before closing hardware
+            self._audio_thread_stop.set()
+            try:
+                self._pcm_queue.put_nowait(None)  # sentinel to unblock thread
+            except Exception:
+                pass
+            if self._audio_thread and self._audio_thread.is_alive():
+                self._audio_thread.join(timeout=2.0)
+                logger.info("[AUDIO THREAD] Joined on cleanup")
+
+            # 7. Close audio hardware LAST
             if self.input_stream:
                 self.input_stream.stop_stream()
                 self.input_stream.close()

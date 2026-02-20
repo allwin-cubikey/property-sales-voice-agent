@@ -231,12 +231,13 @@ class DeepgramSTTService(BaseSTTService):
                     return
 
                 # Flux Turn Detection
-                if confidence >= 0.5 and self.callback_function:
-                    logger.info(f"[STT] Flux Turn {result.turn_index} (conf={confidence:.2f}): \"{transcript}\"")
-                    self._last_turn_index = result.turn_index
-                    # Use asyncio.create_task to avoid blocking the WebSocket loop
-                    asyncio.create_task(self.callback_function(transcript))
+                if confidence >= 0.45:
+                    if self.callback_function:
+                        logger.info(f"[STT] Turn {result.turn_index} (conf={confidence:.2f}): \"{transcript}\" → accepted")
+                        self._last_turn_index = result.turn_index
+                        asyncio.create_task(self.callback_function(transcript))
                 else:
+                    logger.info(f"[STT] Turn {result.turn_index} (conf={confidence:.2f}): \"{transcript}\" → below threshold, discarded")
                     # Interim/Low confidence -> Potential Interruption?
                     if (
                         self.callback_function 

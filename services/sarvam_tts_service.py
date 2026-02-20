@@ -6,10 +6,12 @@ import logging
 import asyncio
 import aiohttp
 import base64
-from typing import Callable, Optional
+from typing import Callable, Optional, Dict, Any
 from services.tts_base import BaseTTSService
 import config
 import re
+import emotion_config
+import time
 logger = logging.getLogger(__name__)
 
 
@@ -38,7 +40,8 @@ class SarvamTTSService(BaseTTSService):
             model: Model to use (default: "bulbul:v3")
         """
         self.api_key = api_key
-        self.voice_id = voice_id or config.SARVAM_VOICE_ID
+        self.voice_id = voice_id or config.SARVAM_VOICE_ID or "priya"
+
         self.language = language or config.SARVAM_LANGUAGE
         self.speed = speed or config.SARVAM_SPEED
         self.model = model or config.SARVAM_MODEL
@@ -66,11 +69,30 @@ class SarvamTTSService(BaseTTSService):
         except Exception as e:
             logger.error(f"[ERROR] Sarvam TTS initialization failed: {e}", exc_info=True)
             return False
+
+    async def prewarm_tts(self):
+        """
+        Send a dummy request to warm up the connection.
+        This helps reduce latency for the first user interaction.
+        """
+        try:
+            logger.info("[TTS] Pre-warming Sarvam TTS connection...")
+            # Synthesize a single valid word - safe and fast
+            await self._synthesize_chunk("Hello") 
+            logger.info("[TTS] Connection pre-warmed")
+        except Exception as e:
+            logger.warning(f"[TTS] Pre-warm failed (non-critical): {e}")
+
     
 
 
-    async def _synthesize_chunk(self, text: str) -> Optional[bytes]:
-        """Helper to synthesize a single chunk of text"""
+    async def _synthesize_chunk(
+        self,
+        text: str,
+        override_params: Optional[Dict[str, Any]] = None,
+    ) -> Optional[bytes]:
+        """Helper to synthesize a single chunk of text, with optional emotion parameter overrides."""
+        start_time = time.time()
         url = config.SARVAM_TTS_URL
         headers = {
             "api-subscription-key": self.api_key,
@@ -86,6 +108,11 @@ class SarvamTTSService(BaseTTSService):
             "enable_preprocessing": True,
             "model": self.model or config.SARVAM_MODEL
         }
+
+        # Apply emotion pace override if provided
+        # Note: bulbul:v3 does NOT support pitch or loudness — pace only.
+        if override_params and "pace" in override_params:
+            payload["pace"] = override_params["pace"]
         
         # Retry once on failure
         for attempt in range(2):
@@ -110,6 +137,12 @@ class SarvamTTSService(BaseTTSService):
                     data = await response.json()
                     if "audios" in data and len(data["audios"]) > 0:
                         raw_audio = base64.b64decode(data["audios"][0])
+                        elapsed = time.time() - start_time
+                        logger.info(
+                            f"[TTS] Segment synthesized in {elapsed:.2f}s "
+                            f"({len(text.split())} words, {len(text)} chars)"
+                        )
+                        
                         # Strip WAV header if present (RIFF....WAVE)
                         if raw_audio[:4] == b'RIFF' and raw_audio[8:12] == b'WAVE':
                             logger.debug("[TTS] Stripping WAV header (44 bytes)")
@@ -134,13 +167,17 @@ class SarvamTTSService(BaseTTSService):
         return None
 
     async def synthesize(
-        self, 
-        text: str, 
-        send_audio_callback: Callable, 
-        speed: Optional[str] = None
+        self,
+        text: str,
+        send_audio_callback: Callable,
+        speed: Optional[str] = None,
+        emotion: Optional[str] = None,
     ) -> bool:
         """
-        Synthesize text to speech with sentence-level splitting and pre-fetching for continuous playback.
+        Synthesize text to speech with sentence-level splitting and pre-fetching.
+        emotion: optional emotion name (e.g. 'friendly', 'calm') — looked up via
+                 emotion_config.get_emotion_params() and applied uniformly to all
+                 segments of this response.
         """
         if not self._is_initialized:
             logger.error("[TTS] Service not initialized")
@@ -274,11 +311,16 @@ class SarvamTTSService(BaseTTSService):
                 final_segments.append(s)
 
         logger.info(f"[TTS] Processing {len(final_segments)} grouped segments for natural flow")
-        
+
+        # Resolve emotion TTS parameters once for the whole response
+        emotion_params = emotion_config.get_emotion_params(emotion)
+        if emotion:
+            logger.info(f"[TTS] Emotion='{emotion}' -> pace={emotion_params['pace']} pitch={emotion_params['pitch']} loudness={emotion_params['loudness']}")
+
         # Queue for audio segments (full sentence audio)
         # Size limit prevents infinite buffering if network is super fast
         audio_queue = asyncio.Queue(maxsize=3)
-        
+
         # PRODUCER: Parallel Fetching
         async def producer():
             # Launch requests one at a time - check stop before each
@@ -288,7 +330,7 @@ class SarvamTTSService(BaseTTSService):
                     logger.info(f"[TTS] Producer stopped before segment {i+1}")
                     break
                 logger.info(f"[TTS] Launching request {i+1}/{len(final_segments)}: '{segment[:30]}...'")
-                tasks.append(asyncio.create_task(self._synthesize_chunk(segment)))
+                tasks.append(asyncio.create_task(self._synthesize_chunk(segment, override_params=emotion_params)))
 
             # Await them in order (to preserve playback sequence)
             for i, task in enumerate(tasks):

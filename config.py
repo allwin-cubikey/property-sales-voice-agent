@@ -15,13 +15,17 @@ WEBHOOK_BASE_URL = os.getenv("WEBHOOK_BASE_URL", "")
 
 # API Keys
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "meta-llama/llama-4-maverick-17b-128e-instruct")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1")
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "")
 CARTESIA_API_KEY = os.getenv("CARTESIA_API_KEY", "")
 CARTESIA_VOICE_ID = os.getenv("CARTESIA_VOICE_ID", "")
 SARVAM_API_KEY = os.getenv("SARVAM_API_KEY", "")
-SARVAM_VOICE_ID = os.getenv("SARVAM_VOICE_ID", "rohan")
+SARVAM_VOICE_ID = os.getenv("SARVAM_VOICE_ID", "manan")
 SARVAM_MODEL = os.getenv("SARVAM_MODEL", "bulbul:v3")
+SMALLEST_API_KEY = os.getenv("SMALLEST_API_KEY", "")
+SMALLEST_MODEL = os.getenv("SMALLEST_MODEL", "waves_lightning_large")
 
 # Exotel
 EXOTEL_ACCOUNT_SID = os.getenv("EXOTEL_ACCOUNT_SID", "")
@@ -32,8 +36,10 @@ EXOTEL_PHONE_NUMBER = os.getenv("EXOTEL_PHONE_NUMBER", "")
 
 # Service Providers
 STT_PROVIDER = os.getenv("STT_PROVIDER", "deepgram")
-TTS_PROVIDER = os.getenv("TTS_PROVIDER", "sarvam")
+TTS_PROVIDER = os.getenv("TTS_PROVIDER", "smallest")  # Default to Smallest.ai Lightning v2
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openai")  # "openai" or "groq"
 TELEPHONY_PROVIDER = "exotel"  # Fixed for this project
+
 
 # LLM Settings
 LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.4"))
@@ -45,8 +51,8 @@ LLM_RETRY_DELAY = int(os.getenv("LLM_RETRY_DELAY", "2"))
 GROQ_URL = os.getenv("GROQ_URL", "https://api.groq.com/openai/v1/chat/completions")
 
 # LLM Configuration with Fallback
-GROQ_PRIMARY_MODEL = os.getenv("GROQ_PRIMARY_MODEL", "llama-3.3-70b-versatile")
-GROQ_FALLBACK_MODEL = os.getenv("GROQ_FALLBACK_MODEL", "llama-3.3-8b-instant")
+GROQ_PRIMARY_MODEL = os.getenv("GROQ_PRIMARY_MODEL", "meta-llama/llama-4-maverick-17b-128e-instruct")
+GROQ_FALLBACK_MODEL = os.getenv("GROQ_FALLBACK_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
 GROQ_USE_FALLBACK = os.getenv("GROQ_USE_FALLBACK", "true").lower() == "true"
 
 # Token optimization
@@ -89,7 +95,7 @@ LANGUAGE = "english"
 VOICE_MAPPINGS = {
     "english": {
         "cartesia_voice_id": "7ea5e9c2-b719-4dc3-b295-6e4ee1b18c26",
-        "sarvam_speaker": "meera",
+        "sarvam_speaker": "manan",
         "stt_lang": "en",
         "tts_lang": "en-IN",
         "agent_name": "Rohan",
@@ -103,4 +109,11 @@ STT_LANGUAGE = LANG["stt_lang"]
 TTS_LANGUAGE = LANG["tts_lang"]
 AGENT_NAME = LANG["agent_name"]
 GREETING_TEMPLATE = LANG["greeting"]
-VOICE_ID = LANG["cartesia_voice_id"] if TTS_PROVIDER == "cartesia" else LANG["sarvam_speaker"]
+if TTS_PROVIDER == "cartesia":
+    VOICE_ID = LANG["cartesia_voice_id"]
+elif TTS_PROVIDER == "deepgram":
+    VOICE_ID = "aura-orion-en"  # Warm professional male (Rohan)
+elif TTS_PROVIDER == "smallest":
+    VOICE_ID = os.getenv("VOICE_ID", "nyah") # Custom voice for Smallest.ai
+else:
+    VOICE_ID = LANG["sarvam_speaker"]

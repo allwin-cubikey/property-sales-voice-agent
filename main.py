@@ -15,9 +15,21 @@ from prompts import STAGE_DEFINITIONS
 from services.stt_factory import STTServiceFactory
 from services.tts_factory import TTSServiceFactory
 from services.llm_service import GroqLLMService
+from services.openai_llm_service import OpenAILLMService
 from services.telephony_factory import TelephonyServiceFactory
 from services.enquiry_storage import EnquiryStorage
 from services.knowledge_validator import KnowledgeValidator
+import emotion_config
+import re as _re
+
+_EMOTION_TAG_RE = _re.compile(r'\[EMOTION:\s*([a-z]+)\]\s*$', _re.IGNORECASE | _re.MULTILINE)
+
+def extract_emotion(text: str):
+    """Strip the [EMOTION: <name>] tag from LLM output. Returns (clean_text, emotion_name)."""
+    match = _EMOTION_TAG_RE.search(text)
+    if match:
+        return text[:match.start()].rstrip(), match.group(1).lower()
+    return text, None
 
 # Initialize logging
 logging.basicConfig(
@@ -252,7 +264,11 @@ async def initialize_call_session(session_id: str, websocket: WebSocket):
         **tts_kwargs
     )
     
-    llm_service = GroqLLMService(api_key=config.GROQ_API_KEY, max_history=config.LLM_MAX_HISTORY)
+    # LLM -- toggle via LLM_PROVIDER env var ("openai" or "groq")
+    if config.LLM_PROVIDER == "openai":
+        llm_service = OpenAILLMService(api_key=config.OPENAI_API_KEY, max_history=config.LLM_MAX_HISTORY)
+    else:
+        llm_service = GroqLLMService(api_key=config.GROQ_API_KEY, max_history=config.LLM_MAX_HISTORY)
     
     # Initialize all services
     await stt_service.initialize(
@@ -336,6 +352,13 @@ async def handle_transcription(text: str, session_id: str):
                           "right", "that's me", "thats me"]):
             if "identity_check" not in completed_stages:
                 completed_stages.append("identity_check")
+            current_stage = "self_intro"  # Always introduce before timing check
+
+    elif current_stage == "self_intro":
+        # Any response from user after intro → move to timing check
+        if len(text_lower.strip()) > 0:
+            if "self_intro" not in completed_stages:
+                completed_stages.append("self_intro")
             current_stage = "timing_check"
 
     elif current_stage == "timing_check":
@@ -363,9 +386,12 @@ async def handle_transcription(text: str, session_id: str):
             current_stage = "site_visit_scheduling"
 
     elif current_stage == "site_visit_scheduling":
-        if any(p in text_lower for p in ["tomorrow", "today", "weekend", "monday", "tuesday",
-                                        "wednesday", "thursday", "friday", "saturday", "sunday",
-                                        "morning", "evening", "afternoon", "night", "next week"]):
+        past_date_phrases = ["last week", "last month", "yesterday", "day before", "last year"]
+        is_past = any(p in text_lower for p in past_date_phrases)
+        future_time_words = ["tomorrow", "today", "weekend", "monday", "tuesday",
+                             "wednesday", "thursday", "friday", "saturday", "sunday",
+                             "morning", "evening", "afternoon", "night", "next week"]
+        if not is_past and any(p in text_lower for p in future_time_words):
             current_stage = "post_visit_confirmed"
 
     session["completed_stages"] = completed_stages
@@ -393,8 +419,9 @@ async def handle_transcription(text: str, session_id: str):
         format_values=format_values
     )
     
-    # STEP 4: Extract response using new schema
+    # STEP 4: Extract response and strip emotion tag
     ai_text = response.get("spoken_text", "")
+    ai_text, detected_emotion = extract_emotion(ai_text)
     intent = response.get("intent", "unknown")
     collected_data = response.get("raw_model_data", {})
 
@@ -478,10 +505,11 @@ async def handle_transcription(text: str, session_id: str):
         except Exception as e:
             logger.warning(f"[{session_id}] STT stop error: {e}")
 
-    # Synthesize response
+    # Synthesize response with detected emotion
     await session["tts_service"].synthesize(
         text=ai_text,
-        send_audio_callback=lambda chunk, action: send_audio_to_exotel(session["websocket"], chunk, action)
+        send_audio_callback=lambda chunk, action: send_audio_to_exotel(session["websocket"], chunk, action),
+        emotion=detected_emotion,
     )
 
     # End call after TTS completes

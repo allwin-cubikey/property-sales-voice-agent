@@ -387,14 +387,20 @@ class GroqLLMService:
             "stream": False
         }
         
-        # Only use strict JSON for 70b models, 8b-instant struggles with it
-        if "70b" in model:
+        # Use strict JSON for large/capable models: 70b Llama 3 family AND all Llama 4 variants
+        is_large_model = "70b" in model or "llama-4" in model.lower()
+        if is_large_model:
             api_payload["response_format"] = {"type": "json_object"}
 
         # For 8b-instant, we'll parse manually (it often fails strict JSON)
         
-        # ANTI-REFLECTION FIX for smaller models and GPT-OSS
-        if "8b" in model or "9b" in model or "gemma" in model.lower() or "gpt-oss" in model:
+        # ANTI-REFLECTION FIX for smaller models and GPT-OSS only
+        # Llama 4 Maverick/Scout are capable models — skip this injection for them
+        is_small_model = (
+            ("8b" in model or "9b" in model or "gemma" in model.lower() or "gpt-oss" in model)
+            and "llama-4" not in model.lower()
+        )
+        if is_small_model:
             # Force conversational response, not schema - be very explicit
             # Append this to the LAST message to ensure recency bias works in our favor
             json_instruction = """

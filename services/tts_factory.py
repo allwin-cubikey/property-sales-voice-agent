@@ -7,6 +7,8 @@ from typing import Dict, Type
 from services.tts_base import BaseTTSService
 from services.tts_service import CartesiaTTSService
 from services.sarvam_tts_service import SarvamTTSService
+from services.deepgram_tts_service import DeepgramTTSService
+from services.smallest_tts_service import SmallestTTSService
 
 logger = logging.getLogger(__name__)
 
@@ -17,10 +19,11 @@ class TTSServiceFactory:
     Supports multiple providers with runtime selection.
     """
     
-    # Provider registry
     _providers: Dict[str, Type[BaseTTSService]] = {
         'cartesia': CartesiaTTSService,
-        'sarvam': SarvamTTSService
+        'sarvam': SarvamTTSService,
+        'deepgram': DeepgramTTSService,
+        'smallest': SmallestTTSService
     }
     
     @classmethod
@@ -35,6 +38,7 @@ class TTSServiceFactory:
             **kwargs: Additional provider-specific arguments
                      For Cartesia: model_id, speed
                      For Sarvam: language, speed
+                     For Deepgram: voice_id
             
         Returns:
             Instance of BaseTTSService
@@ -54,7 +58,10 @@ class TTSServiceFactory:
         service_class = cls._providers[provider]
         service = service_class(api_key=api_key, voice_id=voice_id, **kwargs)
         
-        logger.info(f"[FACTORY] Created {provider} TTS service instance")
+        if provider == "smallest":
+            logger.info(f"[TTS FACTORY] Provider: Smallest.ai Lightning v2 (voice={voice_id}, 24000Hz)")
+        else:
+            logger.info(f"[FACTORY] Created {provider} TTS service instance")
         return service
     
     @classmethod
