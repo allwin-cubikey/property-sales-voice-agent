@@ -138,6 +138,15 @@ class DeepgramSTTService(BaseSTTService):
         logger.info("[STT] Stream started with callback")
         return True
 
+    async def pre_warm(self):
+        """Open STT connection early so it's ready when listening starts."""
+        if self.is_connected:
+            return
+        logger.info("[STT] Pre-warming connection...")
+        # Deepgram initialization already handles connecting
+        await self.initialize(self.api_key)
+        logger.info("[STT] Connection ready")
+
     async def close(self) -> bool:
         """Close STT connection and cleanup."""
         logger.info("[CLEANUP] Closing Deepgram STT service")

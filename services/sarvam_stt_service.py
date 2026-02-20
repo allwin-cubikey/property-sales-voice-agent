@@ -104,6 +104,29 @@ class SarvamSTTService(BaseSTTService):
             logger.error(f"[ERROR] Failed to start Sarvam stream: {e}", exc_info=True)
             self._is_connected = False
             return False
+            
+    async def pre_warm(self):
+        """Open STT connection early so it's ready when listening starts."""
+        if self.is_connected:
+            return
+        logger.info("[STT] Pre-warming connection...")
+        
+        try:
+            self._ws_session = aiohttp.ClientSession()
+            ws_url = config.SARVAM_STT_URL
+            headers = {"api-subscription-key": self.api_key}
+            
+            self.ws = await self._ws_session.ws_connect(
+                ws_url,
+                headers=headers,
+                heartbeat=30.0
+            )
+            self._is_connected = True
+            self._listen_task = asyncio.create_task(self._listen())
+            logger.info("[STT] Connection ready")
+        except Exception as e:
+            logger.error(f"[ERROR] Failed to pre-warm Sarvam: {e}")
+            self._is_connected = False
     
     async def _listen(self):
         """

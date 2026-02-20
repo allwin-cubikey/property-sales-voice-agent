@@ -9,8 +9,21 @@ import aiohttp
 from pydantic import BaseModel, Field, create_model
 from typing import Dict, Any, Optional, List, Union, Type
 import config
+import re
 
 logger = logging.getLogger(__name__)
+
+def safe_json_loads(raw: str) -> dict:
+    raw = raw.strip().lstrip('\ufeff\u200b\u200c\u200d\u00a0')
+    start = raw.find('{')
+    end = raw.rfind('}')
+    if start == -1 or end == -1:
+        raise ValueError("No JSON found")
+    json_str = raw[start:end+1]
+    # Remove literal newlines inside JSON strings
+    json_str = re.sub(r'(?<!\\)\n', ' ', json_str)
+    json_str = re.sub(r'(?<!\\)\r', ' ', json_str)
+    return json.loads(json_str)
 
 
 class DynamicModelGenerator:
@@ -585,9 +598,9 @@ class GroqLLMService:
                 start = text.find('{')
                 end = text.rfind('}') + 1
                 json_str = text[start:end]
-                raw_json = json.loads(json_str)
+                raw_json = safe_json_loads(json_str)
             else:
-                raw_json = json.loads(text)
+                raw_json = safe_json_loads(text)
             
             # Check for schema reflection (model returning the schema itself)
             if "properties" in raw_json and "type" in raw_json and raw_json["type"] == "object":
@@ -687,6 +700,111 @@ class GroqLLMService:
             close_time = time.time() - close_start
             logger.info(f"[TIMING] LLM service closed in {close_time:.3f}s")
             logger.info(f"[CLEANUP] Session closed, conversation history cleared")
+
+    async def stream_sentences(
+        self,
+        user_input: str,
+        barge_in_event: Any = None,
+        format_values: Optional[Dict[str, Any]] = None,
+        conversation_history: Optional[List[Dict[str, str]]] = None,
+    ) -> Any:
+        import re
+        import json
+        import os
+        buffer = ""
+        full_response = ""
+        sentence_end = re.compile(r'(?<=[.!?])\s+')
+        emotion_tag = re.compile(r'\[EMOTION:\s*\w+\]')
+        first = True
+
+        if format_values is None:
+            format_values = {}
+            
+        formatted_prompt = self.format_system_prompt(**format_values)
+        system_prompt = self.generate_system_prompt(formatted_prompt)
+
+        history = list(conversation_history or self.get_conversation_history())
+        if len(history) > 6:
+            history = history[-6:]
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            *history,
+            {"role": "user", "content": user_input},
+        ]
+
+        api_payload = {
+            "model": os.getenv("GROQ_MODEL", getattr(config, "GROQ_PRIMARY_MODEL", "llama-4-maverick")),
+            "messages": messages,
+            "max_tokens": config.MAX_LLM_TOKENS,
+            "temperature": config.LLM_TEMPERATURE,
+            "stream": True
+        }
+
+        async with self.session.post(
+            config.GROQ_URL,
+            headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
+            json=api_payload
+        ) as response:
+            if response.status != 200:
+                logger.error(f"[GROQ] Stream error: {await response.text()}")
+                return
+
+            async for line in response.content:
+                if barge_in_event and barge_in_event.is_set():
+                    break
+                line = line.strip()
+                if not line or line == b'data: [DONE]':
+                    continue
+                if line.startswith(b'data: '):
+                    try:
+                        chunk_str = line[6:].decode('utf-8')
+                        chunk_json = json.loads(chunk_str)
+                        delta = chunk_json.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                        if delta:
+                            full_response += delta
+                            buffer += delta
+                    except Exception:
+                        pass
+                    
+                    clean = emotion_tag.sub('', buffer).strip()
+                    parts = sentence_end.split(clean)
+
+                    if len(parts) > 1:
+                        for sentence in parts[:-1]:
+                            sentence = sentence.strip()
+                            if sentence:
+                                yield (sentence, first)
+                                first = False
+                        buffer = parts[-1]
+
+        clean = emotion_tag.sub('', buffer).strip()
+        if clean:
+            yield (clean, first)
+
+        self._last_full_response = full_response
+        try:
+             data, emotion = self.extract_json_and_emotion(full_response)
+             meta = self._get_default_response()
+             if hasattr(meta["response"], "__dict__"):
+                 meta["response"] = self.ResponseModel(**data)
+             else:
+                 meta["response"] = data
+             meta["intent"] = data.get("intent", "flow_progress")
+             meta["raw_model_data"] = data
+             meta["should_end_call"] = str(data.get("end_call", "no")).lower() == "yes"
+             self.last_response_meta = meta
+        except Exception as e:
+             logger.warning(f"[GROQ STREAM] End-of-stream parse failed: {e}")
+             meta = self._get_default_response()
+             try:
+                 m = re.search(r'"assistant_text"\s*:\s*"((?:[^"\\]|\\.)*)"', full_response, re.DOTALL)
+                 if m:
+                     meta["spoken_text"] = m.group(1).encode('utf-8').decode('unicode_escape')
+             except Exception:
+                 pass
+             meta["raw_response"] = full_response
+             self.last_response_meta = meta
 
     async def stream_response(
         self,
@@ -819,28 +937,8 @@ class GroqLLMService:
                 emotion = None
                 
                 try:
-                    # Fix 2A: Sanitize newlines first
-                    sanitized = full_accum.replace('\r\n', '\\n').replace('\n', '\\n')
-                    
-                    # Fix for trailing emotion tag: Find last closing brace
-                    end_idx = sanitized.rfind('}')
-                    if end_idx != -1:
-                        # Slice JSON part
-                        json_str = sanitized[:end_idx + 1]
-                        tail = sanitized[end_idx + 1:]
-                        
-                        data = json.loads(json_str)
-                        final_text = data.get("assistant_text") or data.get("response") or ""
-                        
-                        # Extract emotion from tail first
-                        emotion_match = re.search(r'\[EMOTION:\s*(\w+)\]', tail, re.IGNORECASE)
-                        if emotion_match:
-                            emotion = emotion_match.group(1).lower()
-                            
-                    else:
-                        # Fallback to robust extraction if no brace found
-                        data = self._extract_json(sanitized)
-                        final_text = data.get("assistant_text") or data.get("response") or ""
+                    data, emotion = self.extract_json_and_emotion(full_accum)
+                    final_text = data.get("assistant_text") or data.get("response") or ""
                         
                 except Exception as e:
                     logger.warning(f"[GROQ] JSON Parse Failed: {e}")
@@ -901,25 +999,73 @@ class GroqLLMService:
         yield "I apologize, I'm having a connection issue.", True, None
         self.last_response_meta = self._get_default_response()
 
-    def _extract_json(self, text: str) -> dict:
-        """Robustly extract JSON object from text, handling markdown and prefixes."""
+    def extract_json_and_emotion(self, raw: str) -> tuple[dict, str | None]:
+        """Extract JSON object and optional emotion tag from Groq raw response."""
         import json
+        import re
         
-        # Strip BOM and invisible unicode characters
-        text = text.strip().lstrip('\ufeff\u200b\u00a0')
-        
-        # Find JSON boundaries
-        start = text.find('{')
-        end = text.rfind('}')
-        
+        # Strip BOM, zero-width spaces, and all leading/trailing whitespace
+        raw = raw.strip().lstrip('\ufeff\u200b\u200c\u200d\u00a0\xa0')
+
+        # Find JSON object boundaries
+        start = raw.find('{')
+        end = raw.rfind('}')
+
         if start == -1 or end == -1 or end <= start:
-            raise ValueError(f"No JSON object found in response: {text[:200]}")
-            
-        json_str = text[start:end + 1]
-        try:
-            return json.loads(json_str)
-        except json.JSONDecodeError as e:
-            raise ValueError(f"Failed to parse extracted JSON: {e}")
+            raise ValueError(f"No JSON object found. Raw: {raw[:300]}")
+
+        json_str = raw[start:end + 1]
+
+        # Sanitize control characters inside string values
+        # Replace literal newlines inside JSON with escaped version
+        # Only replace newlines that are inside the JSON block
+        json_str = json_str.replace('\r\n', ' ').replace('\n', ' ').replace('\r', ' ')
+
+        parsed = json.loads(json_str)
+
+        # Extract emotion from the tail (after closing })
+        tail = raw[end + 1:]
+        
+        # Also check inside assistant_text for embedded emotion tag
+        assistant_text = parsed.get('assistant_text', '')
+        emotion = None
+        if '[EMOTION:' in assistant_text:
+            emotion_match = re.search(r'\[EMOTION:\s*(\w+)\]', assistant_text)
+            if emotion_match:
+                emotion = emotion_match.group(1).lower()
+                parsed['assistant_text'] = re.sub(r'\s*\[EMOTION:\s*\w+\]', '', assistant_text).strip()
+        elif '[EMOTION:' in tail:
+            emotion_match = re.search(r'\[EMOTION:\s*(\w+)\]', tail)
+            if emotion_match:
+                emotion = emotion_match.group(1).lower()
+
+        return parsed, emotion
+        
+    async def quick_extract(self, prompt: str) -> str:
+        """Single-shot extraction call — no streaming, no conversation history."""
+        import asyncio
+        from groq import Groq
+        # We need a groq client instance, or we can use our existing aiohttp session
+        # For simplicity and robust async, use the existing aiohttp session:
+        api_payload = {
+            "model": getattr(config, "GROQ_PRIMARY_MODEL", "llama-4-maverick"),
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 150,
+            "temperature": 0
+        }
+        
+        async with self.session.post(
+            config.GROQ_URL,
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json"
+            },
+            json=api_payload
+        ) as response:
+            result = await response.json()
+            if 'error' in result:
+                raise Exception(f"Groq API error: {result['error']}")
+            return result["choices"][0]["message"]["content"].strip()
 
 
 # Convenience function for quick initialization
