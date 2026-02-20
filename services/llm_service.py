@@ -903,31 +903,23 @@ class GroqLLMService:
 
     def _extract_json(self, text: str) -> dict:
         """Robustly extract JSON object from text, handling markdown and prefixes."""
-        import re
         import json
         
-        text = text.strip()
+        # Strip BOM and invisible unicode characters
+        text = text.strip().lstrip('\ufeff\u200b\u00a0')
         
-        # 1. Strip markdown code fences
-        text = re.sub(r'^```json\s*', '', text, flags=re.MULTILINE)
-        text = re.sub(r'^```\s*', '', text, flags=re.MULTILINE)
-        text = re.sub(r'\s*```$', '', text, flags=re.MULTILINE)
+        # Find JSON boundaries
+        start = text.find('{')
+        end = text.rfind('}')
         
-        # 2. Try direct load
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            pass
+        if start == -1 or end == -1 or end <= start:
+            raise ValueError(f"No JSON object found in response: {text[:200]}")
             
-        # 3. Find first { and last }
-        match = re.search(r'\{.*\}', text, re.DOTALL)
-        if match:
-            try:
-                return json.loads(match.group())
-            except json.JSONDecodeError:
-                pass
-        
-        raise ValueError(f"No valid JSON object found in response: {text[:200]}")
+        json_str = text[start:end + 1]
+        try:
+            return json.loads(json_str)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Failed to parse extracted JSON: {e}")
 
 
 # Convenience function for quick initialization

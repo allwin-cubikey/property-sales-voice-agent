@@ -102,6 +102,8 @@ STOP_WORDS = [
 RECORD_TIMEOUT = 60  # seconds - increased for better UX
 SILENCE_PROMPT_TIMEOUT = 30 # seconds - prompt user if quiet for this long
 
+MAX_BARGE_IN_BYTES = 16000 * 2 * 5  # 5 seconds at 16kHz 16-bit
+
 
 # ---------------------------------------------------------------------------
 # Emotion extraction utility
@@ -136,6 +138,9 @@ class LocalVoiceClient:
         
         # Initialize PyAudio
         self.audio = pyaudio.PyAudio()
+        
+        from collections import deque
+        self._mic_pre_buffer = deque(maxlen=30)  # rolling 30-frame (~900ms) pre-buffer
         
         # Service instances
         self.stt_service = None
@@ -424,19 +429,18 @@ class LocalVoiceClient:
                     # BARGE-IN ROUTING (The Critical Part)
                     # ─────────────────────────────────────────────────────────
                     if self.is_playing:
-                        # [DEBUG] Confirm we are here
-                        # print("P", end="", flush=True) 
+                        # Always store in pre-buffer
+                        self._mic_pre_buffer.append(pcm_data)
                         
                         # 1. Route to detector (never discard!)
                         triggered = await self.barge_in_detector.process_mic_frame(pcm_data)
                         
-                        # 2. Buffer if currently handling a confirmed barge-in
                         if triggered:
-                            self.capturing_barge_in = True
-                            self.barge_in_audio_buffer = [pcm_data]
-                            
-                        if self.capturing_barge_in:
-                            self.barge_in_audio_buffer.append(pcm_data)
+                            # handle_barge_in will be called by the detector callback
+                            pass
+                        elif self.capturing_barge_in:
+                            if sum(len(c) for c in self.barge_in_audio_buffer) < MAX_BARGE_IN_BYTES:
+                                self.barge_in_audio_buffer.append(pcm_data)
                             
                         # 3. Skip normal STT while playing
                         continue
@@ -452,7 +456,8 @@ class LocalVoiceClient:
 
                     # Also capture into barge-in buffer if we are still in the interruption phase
                     if self.capturing_barge_in:
-                        self.barge_in_audio_buffer.append(pcm_data)
+                        if sum(len(c) for c in self.barge_in_audio_buffer) < MAX_BARGE_IN_BYTES:
+                            self.barge_in_audio_buffer.append(pcm_data)
 
                     # logger.debug("Reading audio...")
                     self.add_to_recording(pcm_data)
@@ -489,56 +494,50 @@ class LocalVoiceClient:
         Called by BargeInDetector when a genuine user interruption is confirmed.
         Must: stop playback, cancel pipeline, send buffered audio to STT.
         """
-        logger.info("[BARGE-IN] Handling interruption — stopping agent speech")
+        # 1. Snapshot the buffer BEFORE clearing it
+        # Snapshot pre-buffer DIRECTLY — do not rely on barge_in_audio_buffer
+        # because record_audio_loop hasn't assigned it yet at this point
+        captured_audio = list(self._mic_pre_buffer)
+        
+        # 2. NOW clear state
+        self._mic_pre_buffer.clear()
+        self.barge_in_audio_buffer = []
+        self.capturing_barge_in = False
+        
+        logger.info(f"[BARGE-IN] Handling interruption — {len(captured_audio)} frames captured")
 
-        # 1. Signal all threads to stop via the cancellation event
+        # 3. Stop playback
         self.barge_in_event.set()
 
-        # 2. Stop TTS playback immediately
-        # Stop stream but keep open? Or just clear queue?
-        # Clear queue to stop thread consuming
         with self._pcm_queue.mutex:
             self._pcm_queue.queue.clear()
             
-        # [NEW] Stop the TTS provider (aborts producer loop)
         if self.tts_service:
             await self.tts_service.stop()
         
-        # 3. Notify VAD that playback stopped (force)
         self.barge_in_detector.notify_playback_stop()
-        self.is_playing = False # Updates state immediately
+        self.is_playing = False
 
-        # 4. Disable barge-in detection while we process the interruption
         self.barge_in_detector.disable()
         
-        # Flag this turn
         self.last_turn_was_barge_in = True
 
-        # 5. Brief wait to let threads exit
-        await asyncio.sleep(0.1)
-
-        # 6. Clear event NOW — before sending to STT
-        # This prevents new playback threads from being blocked if they were spurious,
-        # but more importantly, the guard in _ensure_audio_thread prevents respawn during the 0.1s wait.
+        # 4. Wait a little for user to finish their first word
+        await asyncio.sleep(0.2)
+        
         self.barge_in_event.clear()
 
-        # 7. Send buffered audio to Deepgram STT
-        if self.barge_in_audio_buffer:
-            audio_data = b''.join(self.barge_in_audio_buffer)
+        # 5. Send the SNAPSHOT (not the now-empty buffer) to STT
+        if captured_audio:
+            audio_data = b''.join(captured_audio)
             logger.info(f"[BARGE-IN] Sending {len(audio_data)} bytes of interrupted speech to STT")
-            # Route through existing STT path — this will trigger handle_transcription
             if self.stt_service:
                 await self.stt_service.process_audio(audio_data)
+        else:
+            logger.warning("[BARGE-IN] No audio captured during interruption — user must speak again")
 
-        # 8. Reset state
-        self.barge_in_audio_buffer = []
-        self.capturing_barge_in = False
-
-        # 9. Re-enable barge-in detection after processing
-        # Wait a bit or let handle_transcription flow re-enable naturally?
-        # Actually detector should be re-enabled when we are ready to listen again
-        # But we are continuously listening. 
-        await asyncio.sleep(0.8)  # wait for STT + LLM cycle to start
+        # 6. Re-enable after STT cycle starts
+        await asyncio.sleep(0.8)
         self.barge_in_detector.enable()
 
         logger.info("[BARGE-IN] Interruption handled — pipeline reset")
@@ -632,6 +631,7 @@ class LocalVoiceClient:
                 self.stt_muted = False    # Unmute STT (resume listening)
                 self.is_playing = False
                 self.barge_in_detector.notify_playback_stop() # [NEW]
+                self._mic_pre_buffer.clear() # Clear stale audio before listening
                 logger.info("[AUDIO] Playback finished + 500ms delay - listening resumed")
                 
                 # Optional: continue waiting for full drain if needed, but returning early allows flow to proceed
@@ -641,6 +641,7 @@ class LocalVoiceClient:
                 self._playback_callback_fired = False  # Reset flag for new playback
                 if not self.is_playing:
                     self.is_playing = True
+                    self.barge_in_detector.enable() # [NEW] Re-enable after LLM step
                     self.barge_in_detector.notify_playback_start() # [NEW]
                     self._ensure_audio_thread()
                 
@@ -1073,6 +1074,9 @@ class LocalVoiceClient:
             return
 
         self.is_processing = True
+        
+        # [NEW] Disable barge-in detection while LLM is processing
+        self.barge_in_detector.disable()
 
         try:
             # Handle force stop

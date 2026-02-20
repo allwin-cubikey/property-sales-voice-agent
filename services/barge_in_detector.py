@@ -137,10 +137,11 @@ class BargeInDetector:
                 self.speech_frame_count = 0
 
         # Trigger only when playing AND speech sustained long enough
+        MIN_SPEECH_RMS = 300  # minimum mic energy to be considered speech
         if self.speech_frame_count >= self.sustain_frames_required and self.is_playing:
             # [NEW] Energy Gate: Reject trigger if mic energy is too low (noise floor)
-            if mic_rms < 300:
-                log.debug(f"[VAD] Suppressed low-energy trigger: mic_rms={mic_rms:.0f} < 300")
+            if mic_rms < MIN_SPEECH_RMS:
+                log.debug(f"[VAD] Suppressed low-energy trigger: mic_rms={mic_rms:.0f} < {MIN_SPEECH_RMS}")
                 self.speech_frame_count = 0
                 self._vad_window.clear()
                 return False
