@@ -688,6 +688,167 @@ class GroqLLMService:
             logger.info(f"[TIMING] LLM service closed in {close_time:.3f}s")
             logger.info(f"[CLEANUP] Session closed, conversation history cleared")
 
+    async def stream_response(
+        self,
+        user_input: str,
+        format_values: Optional[Dict[str, Any]] = None,
+        conversation_history: Optional[List[Dict[str, str]]] = None,
+    ) -> Any:
+        """
+        Stream handler for Groq that accumulates full response before yielding.
+        matches OpenAILLMService signature for compatibility with test_local.py
+        
+        Yields exactly once: (full_assistant_text, True, emotion)
+        """
+        import os
+        import json
+        import time
+        import re
+        
+        # Initialize loop variables
+        if not self.session:
+             self.session = aiohttp.ClientSession()
+             
+        if format_values is None:
+            format_values = {}
+
+        # Reset last meta
+        self.last_response_meta = self._get_default_response()
+        stream_start = time.time()
+        
+        try:
+            # 1. Prepare Prompt
+            formatted_prompt = self.format_system_prompt(**format_values)
+            system_prompt = self.generate_system_prompt(formatted_prompt)
+
+            history = list(conversation_history or self.get_conversation_history())
+            if len(history) > 6:
+                history = history[-6:]
+
+            messages = [
+                {"role": "system", "content": system_prompt},
+                *history,
+                {"role": "user", "content": user_input},
+            ]
+            
+            # 2. Determine Model
+            default_model = "llama-4-maverick"
+            model = os.getenv("GROQ_MODEL", getattr(config, "GROQ_PRIMARY_MODEL", default_model))
+            
+            # 3. Prepare API Call
+            api_payload = {
+                "model": model,
+                "messages": messages,
+                "temperature": config.LLM_TEMPERATURE,
+                "top_p": config.LLM_TOP_P,
+                "max_tokens": config.MAX_LLM_TOKENS,
+                "stream": True
+            }
+            
+            # Use strict JSON for new models
+            if "llama-4" in model.lower() or "70b" in model:
+                api_payload["response_format"] = {"type": "json_object"}
+            
+            # 4. Execute Stream (Accumulate)
+            full_accum = ""
+            api_start = time.time()
+            
+            async with self.session.post(
+                config.GROQ_URL,
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json"
+                },
+                json=api_payload
+            ) as response:
+            
+                if response.status != 200:
+                    text_err = await response.text()
+                    logger.error(f"[GROQ] Stream error {response.status}: {text_err}")
+                    yield "I apologize, I'm having a connection issue.", True, None
+                    return
+
+                # Read lines for SSE
+                async for line in response.content:
+                    line = line.strip()
+                    if not line or line == b'data: [DONE]':
+                        continue
+                        
+                    if line.startswith(b'data: '):
+                        chunk_str = line[6:].decode('utf-8')
+                        try:
+                            chunk_json = json.loads(chunk_str)
+                            delta = chunk_json.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                            if delta:
+                                full_accum += delta
+                        except Exception:
+                            pass
+            
+            # 5. Process Full Response
+            api_time = time.time() - api_start
+            
+            # Parsing logic (inline to avoid dependency issues)
+            final_text = ""
+            try:
+                # Basic json repair if needed
+                json_text = full_accum.strip()
+                # If we have an open quote at the end, close it
+                if json_text.count('"') % 2 != 0: json_text += '"'
+                if json_text.count("{") > json_text.count("}"): json_text += "}"
+                
+                data = json.loads(json_text)
+                final_text = data.get("assistant_text") or data.get("response") or ""
+            except Exception:
+                # Regex fallback
+                m = re.search(r'"assistant_text"\s*:\s*"((?:[^"\\]|\\.)*)"', full_accum, re.DOTALL)
+                if m:
+                     try:
+                        final_text = m.group(1).encode('utf-8').decode('unicode_escape')
+                     except:
+                        final_text = m.group(1)
+            
+            if not final_text:
+                 final_text = full_accum # Fallback
+            
+            # Extract Emotion
+            emotion = None
+            emotion_match = re.search(r"\[EMOTION:\s*([a-z]+)\]\s*$", final_text, re.IGNORECASE | re.MULTILINE)
+            if emotion_match:
+                emotion = emotion_match.group(1).lower()
+                final_text = final_text[:emotion_match.start()].strip()
+            
+            logger.info(f"[GROQ] Full stream received in {api_time:.2f}s ({len(full_accum)} chars) | intent=unknown | emotion={emotion}")
+            
+            yield final_text, True, emotion
+            
+            # 6. Parse Meta
+            try:
+                # Reuse existing parsing logic
+                parsed = self._parse_fallback_response(full_accum)
+                
+                intent = getattr(parsed, 'intent', 'unknown')
+                should_end = False
+                if hasattr(parsed, 'end_call') and str(parsed.end_call).lower() in ('yes', 'true', '1'):
+                     should_end = True
+                elif hasattr(parsed, 'callback_scheduled') and str(parsed.callback_scheduled).lower() == 'yes':
+                     should_end = True
+
+                self.last_response_meta = {
+                    "response": parsed,
+                    "spoken_text": final_text,
+                    "intent": intent,
+                    "should_end_call": should_end,
+                    "raw_model_data": parsed.model_dump(),
+                    "raw_response": full_accum
+                }
+            except Exception as e:
+                logger.error(f"[GROQ] Meta parse failed: {e}")
+                
+        except Exception as e:
+            logger.error(f"[ERROR] Groq stream_response failed: {e}", exc_info=True)
+            yield "I apologize, I'm having a system issue.", True, None
+            self.last_response_meta = self._get_default_response()
+
 
 # Convenience function for quick initialization
 async def create_llm_service(
