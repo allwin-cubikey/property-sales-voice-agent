@@ -814,14 +814,34 @@ class GroqLLMService:
                     retry_count += 1
                     continue
 
-                # Parsing logic using robust extraction
+                # Parsing logic using slice approach (Fix 1: Handle trailing emotion tags)
                 final_text = ""
+                emotion = None
+                
                 try:
-                    # Robust extraction (Fix 2A: Sanitize newlines)
-                    # Replace literal newlines within string values to escaped \n before parsing
+                    # Fix 2A: Sanitize newlines first
                     sanitized = full_accum.replace('\r\n', '\\n').replace('\n', '\\n')
-                    data = self._extract_json(sanitized)
-                    final_text = data.get("assistant_text") or data.get("response") or ""
+                    
+                    # Fix for trailing emotion tag: Find last closing brace
+                    end_idx = sanitized.rfind('}')
+                    if end_idx != -1:
+                        # Slice JSON part
+                        json_str = sanitized[:end_idx + 1]
+                        tail = sanitized[end_idx + 1:]
+                        
+                        data = json.loads(json_str)
+                        final_text = data.get("assistant_text") or data.get("response") or ""
+                        
+                        # Extract emotion from tail first
+                        emotion_match = re.search(r'\[EMOTION:\s*(\w+)\]', tail, re.IGNORECASE)
+                        if emotion_match:
+                            emotion = emotion_match.group(1).lower()
+                            
+                    else:
+                        # Fallback to robust extraction if no brace found
+                        data = self._extract_json(sanitized)
+                        final_text = data.get("assistant_text") or data.get("response") or ""
+                        
                 except Exception as e:
                     logger.warning(f"[GROQ] JSON Parse Failed: {e}")
                     # Regex fallback for text
@@ -836,12 +856,12 @@ class GroqLLMService:
                      # If it's just text (model ignored JSON instr completely), use it
                      final_text = full_accum.strip()
                 
-                # Extract Emotion
-                emotion = None
-                emotion_match = re.search(r"\[EMOTION:\s*([a-z]+)\]\s*$", final_text, re.IGNORECASE | re.MULTILINE)
-                if emotion_match:
-                    emotion = emotion_match.group(1).lower()
-                    final_text = final_text[:emotion_match.start()].strip()
+                # If emotion not found in tail, check final_text (model might have put it inside JSON string)
+                if not emotion:
+                    emotion_match = re.search(r"\[EMOTION:\s*([a-z]+)\]\s*$", final_text, re.IGNORECASE | re.MULTILINE)
+                    if emotion_match:
+                        emotion = emotion_match.group(1).lower()
+                        final_text = final_text[:emotion_match.start()].strip()
                 
                 logger.info(f"[GROQ] Full stream received in {api_time:.2f}s ({len(full_accum)} chars) | intent=unknown | emotion={emotion}")
                 

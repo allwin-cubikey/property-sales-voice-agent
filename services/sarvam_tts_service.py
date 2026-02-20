@@ -166,6 +166,10 @@ class SarvamTTSService(BaseTTSService):
                 return None
         return None
 
+    def set_barge_in_event(self, event: asyncio.Event):
+        """Set the barge-in event for checking interruptions."""
+        self.barge_in_event = event
+
     async def synthesize(
         self,
         text: str,
@@ -329,6 +333,13 @@ class SarvamTTSService(BaseTTSService):
                 if self._is_stopped:
                     logger.info(f"[TTS] Producer stopped before segment {i+1}")
                     break
+                
+                # [NEW] Barge-in check using instance attribute
+                if hasattr(self, 'barge_in_event') and self.barge_in_event and self.barge_in_event.is_set():
+                    logger.info("[TTS] Barge-in detected in producer — aborting tasks")
+                    self._is_stopped = True
+                    break
+
                 logger.info(f"[TTS] Launching request {i+1}/{len(final_segments)}: '{segment[:30]}...'")
                 tasks.append(asyncio.create_task(self._synthesize_chunk(segment, override_params=emotion_params)))
 
@@ -340,6 +351,13 @@ class SarvamTTSService(BaseTTSService):
                     for remaining in tasks[i+1:]:
                         remaining.cancel()
                     logger.info(f"[TTS] Cancelled remaining {len(tasks)-i} segments")
+                    break
+                
+                if hasattr(self, 'barge_in_event') and self.barge_in_event and self.barge_in_event.is_set():
+                    logger.info("[TTS] Barge-in detected during await — cancelling remaining")
+                    self._is_stopped = True
+                    task.cancel()
+                    for remaining in tasks[i+1:]: remaining.cancel()
                     break
 
                 try:
@@ -367,6 +385,12 @@ class SarvamTTSService(BaseTTSService):
         
         try:
             while not self._is_stopped:
+                # [NEW] Barge-in check (consumer)
+                if hasattr(self, 'barge_in_event') and self.barge_in_event and self.barge_in_event.is_set():
+                    logger.info("[TTS] Barge-in detected in consumer — stopping")
+                    self._is_stopped = True
+                    break
+
                 # Wait for next segment from queue
                 # This allows consumer to wait if producer is slow (silence)
                 # But if producer is fast, it's already here
@@ -381,6 +405,11 @@ class SarvamTTSService(BaseTTSService):
                 # Stream the segment
                 for j in range(0, len(segment_audio), chunk_size):
                     if self._is_stopped:
+                        break
+                    # [NEW] Barge-in check inside chunk streaming
+                    if hasattr(self, 'barge_in_event') and self.barge_in_event and self.barge_in_event.is_set():
+                        logger.info("[TTS] Barge-in detected during chunk streaming — stopping playback")
+                        self._is_stopped = True
                         break
                         
                     chunk = segment_audio[j:j + chunk_size]
